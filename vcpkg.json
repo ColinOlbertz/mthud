@@ -1,0 +1,13 @@
+{
+  "name": "mthud",
+  "version-string": "0.1.0",
+  "dependencies": [
+    "opencv4[contrib]",
+    "glfw3",
+    "glad",
+    "eigen3",
+    "nlohmann-json",
+    "fmt",
+    "spdlog"
+  ]
+}

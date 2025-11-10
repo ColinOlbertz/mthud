@@ -1,0 +1,22 @@
+# Build trees
+/build/
+/out/
+/bin/
+/obj/
+/CMakeFiles/
+/CMakeCache.txt
+
+# Visual Studio
+/.vs/
+*.sln
+*.vcxproj*
+*.user
+*.pdb
+*.ilk
+
+# vcpkg installed artifacts
+/vcpkg_installed/
+
+# Misc
+.DS_Store
+Thumbs.db
