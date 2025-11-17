@@ -1,136 +1,142 @@
 cmake_minimum_required(VERSION 3.20)
-project(mthud LANGUAGES CXX)
 
-# ---- toolchain-agnostic project setup ----
+project(mthud LANGUAGES C CXX)
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# Warnings
-if (MSVC)
-  add_compile_options(/W4 /EHsc /permissive- /Zc:preprocessor)
-else()
-  add_compile_options(-Wall -Wextra -Wpedantic)
-endif()
+# ---- Options ---------------------------------------------------------------
+option(USE_XSENS "Enable Xsens MT SDK integration" ON)
 
-# Let code find repo assets at runtime if you use PROJECT_SOURCE_DIR in C++
-add_compile_definitions(PROJECT_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
-
-# ---- dependencies (resolved by vcpkg manifest) ----
+# ---- Dependencies via vcpkg / system --------------------------------------
+find_package(Threads REQUIRED)
+find_package(OpenCV 4 REQUIRED COMPONENTS core imgproc videoio aruco highgui)
 find_package(glfw3 CONFIG REQUIRED)
 find_package(glad CONFIG REQUIRED)
-find_package(Freetype CONFIG REQUIRED)
-find_package(Eigen3 CONFIG REQUIRED)
+find_package(Freetype REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
+find_package(spdlog CONFIG QUIET)
 
-# Ask OpenCV for specific modules, including ArUco
-# If COMPONENTS fails on your setup, drop "COMPONENTS ..." and link modules explicitly.
-find_package(OpenCV CONFIG REQUIRED COMPONENTS core imgproc highgui videoio aruco)
+if(UNIX AND NOT APPLE)
+  find_package(OpenGL REQUIRED) # for GL symbols when linking with GLAD/GLFW
+endif()
 
-# ---- build target ----
-add_executable(mthud
+# ---- Sources ---------------------------------------------------------------
+set(MTHUD_SOURCES
   src/main.cpp
-  src/app.hpp
-  src/sensor.hpp
-  src/aruco_tracker.hpp
   src/aruco_tracker.cpp
-  src/hud_renderer.hpp
   src/hud_renderer.cpp
-  src/config.hpp
   src/config.cpp
 )
 
-# ---- XSens (optional, ON by default on Windows, OFF elsewhere) ----
-option(USE_XSENS "Build with XSens MT SDK" ${WIN32})
-
-if (USE_XSENS)
-  message(STATUS "XSens support enabled")
-
-  # Select headers/libs per platform.
-  if (WIN32)
-    # Prefer an environment variable; fall back to default install path.
-    set(XSENS_SDK_ROOT "$ENV{XSENS_SDK_ROOT}" CACHE PATH "XSens MT SDK root")
-    if (NOT XSENS_SDK_ROOT)
-      set(XSENS_SDK_ROOT "C:/Program Files/Xsens/MT SDK/x64")
-    endif()
-    set(XSENS_INCLUDE_DIR "${XSENS_SDK_ROOT}/include")
-    set(XSENS_LIB_DIR     "${XSENS_SDK_ROOT}/lib")
-    set(XSENS_LIBS xsensdeviceapi64 xstypes64)
-
-    target_include_directories(mthud PRIVATE "${XSENS_INCLUDE_DIR}")
-    target_link_directories(mthud  PRIVATE "${XSENS_LIB_DIR}")
-    target_link_libraries(mthud    PRIVATE ${XSENS_LIBS})
-
-    # Copy Windows runtime DLLs next to the exe (Windows only)
-    add_custom_command(TARGET mthud POST_BUILD
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${XSENS_LIB_DIR}/xsensdeviceapi64.dll" "$<TARGET_FILE_DIR:mthud>/"
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${XSENS_LIB_DIR}/xstypes64.dll" "$<TARGET_FILE_DIR:mthud>/"
-    )
-  elseif(UNIX)
-    # On Linux you must install the MT SDK yourself or supply paths.
-    # Example layout if you placed the SDK under /opt/xsens:
-    set(XSENS_SDK_ROOT "$ENV{XSENS_SDK_ROOT}" CACHE PATH "XSens MT SDK root")
-    if (XSENS_SDK_ROOT)
-      set(XSENS_INCLUDE_DIR "${XSENS_SDK_ROOT}/include")
-      set(XSENS_LIB_DIR     "${XSENS_SDK_ROOT}/lib")
-      # Typical Linux libs are libxstypes.so and libxsensdeviceapi.so
-      find_library(XSTYPES   NAMES xstypes   PATHS "${XSENS_LIB_DIR}")
-      find_library(XSDEVICE  NAMES xsensdeviceapi PATHS "${XSENS_LIB_DIR}")
-
-      if (XSTYPES AND XSDEVICE)
-        target_include_directories(mthud PRIVATE "${XSENS_INCLUDE_DIR}")
-        target_link_directories(mthud  PRIVATE "${XSENS_LIB_DIR}")
-        target_link_libraries(mthud    PRIVATE ${XSDEVICE} ${XSTYPES})
-      else()
-        message(FATAL_ERROR "XSens libs not found under ${XSENS_SDK_ROOT}. Set XSENS_SDK_ROOT or disable USE_XSENS.")
-      endif()
-    else()
-      message(FATAL_ERROR "Set XSENS_SDK_ROOT on Linux or configure with -DUSE_XSENS=OFF.")
-    endif()
-  endif()
-
-  target_compile_definitions(mthud PRIVATE USE_XSENS=1)
-  # Only compile the XSens source when enabled.
-  target_sources(mthud PRIVATE src/sensor_xsens.cpp)
-else()
-  message(STATUS "XSens support disabled")
-  target_compile_definitions(mthud PRIVATE USE_XSENS=0)
-  # If you have a stub, add it here so the build still provides a sensor interface.
-  if (EXISTS "${CMAKE_SOURCE_DIR}/src/sensor_stub.cpp")
-    target_sources(mthud PRIVATE src/sensor_stub.cpp)
-  endif()
+if(USE_XSENS)
+  list(APPEND MTHUD_SOURCES src/sensor_xsens.cpp)
 endif()
 
-# ---- link third-party libraries ----
-target_link_libraries(mthud PRIVATE
-  glfw
-  glad::glad
-  Freetype::Freetype
-  Eigen3::Eigen
-  nlohmann_json::nlohmann_json
-  opencv_core
-  opencv_imgproc
-  opencv_highgui
-  opencv_videoio
-  opencv_aruco
+add_executable(mthud ${MTHUD_SOURCES})
+
+# String macro used by your code
+target_compile_definitions(mthud PRIVATE PROJECT_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+
+# Warnings
+if(MSVC)
+  target_compile_options(mthud PRIVATE /W4 /permissive-)
+else()
+  target_compile_options(mthud PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+# Base include paths
+target_include_directories(mthud PRIVATE
+  ${OpenCV_INCLUDE_DIRS}
 )
 
-# ---- example: copy runtime data if you still depend on side-by-side files ----
-foreach(f calibration.json calibration.yaml)
-  if (EXISTS "${CMAKE_SOURCE_DIR}/src/${f}")
+# Base libraries
+target_link_libraries(mthud PRIVATE
+  glad::glad
+  glfw
+  ${OpenCV_LIBS}
+  Freetype::Freetype
+  nlohmann_json::nlohmann_json
+  Threads::Threads
+)
+
+if(spdlog_FOUND)
+  target_link_libraries(mthud PRIVATE spdlog::spdlog_header_only)
+endif()
+
+if(UNIX AND NOT APPLE)
+  target_link_libraries(mthud PRIVATE OpenGL::GL dl)
+endif()
+
+# ---- Xsens MT SDK ----------------------------------------------------------
+if(USE_XSENS)
+  target_compile_definitions(mthud PRIVATE USE_XSENS=1)
+
+  # Resolve SDK root from cache var or env
+  if(NOT XSENS_SDK_ROOT AND DEFINED ENV{XSENS_SDK_ROOT})
+    set(XSENS_SDK_ROOT "$ENV{XSENS_SDK_ROOT}")
+  endif()
+  set(XSENS_SDK_ROOT "${XSENS_SDK_ROOT}" CACHE PATH "Path to Xsens MT SDK root (contains include/ and lib/)")
+
+  if(WIN32)
+    # Headers
+    find_path(XSENS_INCLUDE_DIR xsensdeviceapi.h
+      HINTS "${XSENS_SDK_ROOT}/include"
+            "$ENV{ProgramFiles}/Xsens/MT SDK/include"
+            "$ENV{ProgramFiles(x86)}/Xsens/MT SDK/include")
+
+    # Libs (names vary by SDK version)
+    find_library(XSENS_LIB   NAMES xsensdeviceapi xsensdeviceapi64
+      HINTS "${XSENS_SDK_ROOT}/lib"
+            "$ENV{ProgramFiles}/Xsens/MT SDK/lib"
+            "$ENV{ProgramFiles(x86)}/Xsens/MT SDK/lib")
+    find_library(XSTYPES_LIB NAMES xstypes xstypes64
+      HINTS "${XSENS_SDK_ROOT}/lib"
+            "$ENV{ProgramFiles}/Xsens/MT SDK/lib"
+            "$ENV{ProgramFiles(x86)}/Xsens/MT SDK/lib")
+  else()
+    # Linux default locations
+    find_path(XSENS_INCLUDE_DIR xsensdeviceapi.h
+      HINTS "${XSENS_SDK_ROOT}/include" "/usr/local/xsens/mt-sdk/include")
+    find_library(XSENS_LIB   NAMES xsensdeviceapi
+      HINTS "${XSENS_SDK_ROOT}/lib" "/usr/local/xsens/mt-sdk/lib")
+    find_library(XSTYPES_LIB NAMES xstypes
+      HINTS "${XSENS_SDK_ROOT}/lib" "/usr/local/xsens/mt-sdk/lib")
+
+    # Make runtime find the shared libs
+    set_target_properties(mthud PROPERTIES
+      BUILD_RPATH   "${XSENS_SDK_ROOT}/lib;$ORIGIN"
+      INSTALL_RPATH "${XSENS_SDK_ROOT}/lib;$ORIGIN")
+
+    # Also drop the .so files next to the exe for convenience
     add_custom_command(TARGET mthud POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CMAKE_SOURCE_DIR}/src/${f}" "$<TARGET_FILE_DIR:mthud>/")
+              "${XSENS_SDK_ROOT}/lib/libxsensdeviceapi.so" "$<TARGET_FILE_DIR:mthud>/"
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+              "${XSENS_SDK_ROOT}/lib/libxstypes.so" "$<TARGET_FILE_DIR:mthud>/")
+  endif()
+
+  if(NOT XSENS_INCLUDE_DIR OR NOT XSENS_LIB OR NOT XSTYPES_LIB)
+    message(FATAL_ERROR "Xsens SDK not found. Set XSENS_SDK_ROOT to your mt-sdk root (with include/ and lib/).")
+  endif()
+
+  target_include_directories(mthud PRIVATE "${XSENS_INCLUDE_DIR}")
+  target_link_libraries(mthud PRIVATE "${XSENS_LIB}" "${XSTYPES_LIB}")
+else()
+  target_compile_definitions(mthud PRIVATE USE_XSENS=0)
+endif()
+
+# ---- Runtime assets --------------------------------------------------------
+foreach(f calibration.json calibration.yaml)
+  if(EXISTS "${CMAKE_SOURCE_DIR}/src/${f}")
+    add_custom_command(TARGET mthud POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+              "${CMAKE_SOURCE_DIR}/src/${f}" "$<TARGET_FILE_DIR:mthud>/")
   endif()
 endforeach()
 
-# ---- Intel OpenMP DLL copy (Windows only, optional) ----
-if (WIN32)
-  set(_iomp_hint_dirs
-    "C:/Program Files (x86)/Intel/oneAPI/compiler/2025.2/redist/intel64_win/compiler"
-    "$ENV{ONEAPI_ROOT}/compiler/latest/windows/redist/intel64_win/compiler"
-    "$ENV{ONEAPI_ROOT}/redist/intel64_win/compiler"
-  )
-  find_file(LIBIOMP5_DLL NAMES libiomp5md.dll PATHS ${_iomp_hint_dirs} NO_DEFAULT
-  )
+# ---- Install (optional) ----------------------------------------------------
+install(TARGETS mthud RUNTIME DESTINATION bin)
+
