@@ -1,0 +1,22 @@
+{
+  "cmake.generator": "Ninja",
+  "cmake.configureOnOpen": true,
+  "cmake.buildDirectory": "${workspaceFolder}/build",
+  "cmake.configureSettings": {
+    "CMAKE_TOOLCHAIN_FILE": "${env:VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+    "VCPKG_TARGET_TRIPLET": "x64-linux",
+    "CMAKE_BUILD_TYPE": "Release",
+    "USE_XSENS": "ON"
+  },
+  "cmake.configureEnvironment": {
+    "XSENS_SDK_ROOT": "/usr/local/xsens/mt-sdk"
+  },
+  "cmake.buildEnvironment": {
+    "LD_LIBRARY_PATH": "/usr/local/xsens/mt-sdk/lib:${env:LD_LIBRARY_PATH}"
+  },
+  "cmake.launchEnvironment": {
+    "LD_LIBRARY_PATH": "/usr/local/xsens/mt-sdk/lib:${env:LD_LIBRARY_PATH}",
+    "GDK_BACKEND": "x11",
+    "MTHUD_CAMERA_INDEX": "0"
+  }
+}

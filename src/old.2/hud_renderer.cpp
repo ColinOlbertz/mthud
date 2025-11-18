@@ -471,8 +471,7 @@ void HudRenderer::draw(const HudState& s) {
         // heading readout below the caret (3 digits)
         {
             int hdg = 360 - (int)std::lround(wrap360(s.hdg_deg));
-            char hbuf[16];
-            int v = std::clamp(hdg, -999, 999);
+            char hbuf[8];
             std::snprintf(hbuf, sizeof(hbuf), "%03d", hdg);
 
             float h = 36.f * std::max(0.2f, s.text_scale);  // text height in px
@@ -682,8 +681,8 @@ void HudRenderer::draw(const HudState& s) {
                 };
 
             const float r = 18.0f; // circle radius (px)
-            const float wing = 34.0f; // wing length from circle edge
-            const float tail = 26.0f; // tail length below circle
+            const float wing = 26.0f; // wing length from circle edge
+            const float tail = 34.0f; // tail length below circle
 
             // circle as line segments
             for (int i = 0; i < 64; i++) {
@@ -697,7 +696,7 @@ void HudRenderer::draw(const HudState& s) {
             add(-(r + wing), 0.0f, -r, 0.0f);
             add(+(r + wing), 0.0f, r, 0.0f);
             // tail (downward from circle)
-            add(0.0f, -r, 0.0f, (r + tail));
+            add(0.0f, -r, 0.0f, -(r + tail));
 
             updateLines_(segs.data(), int(segs.size() / 2));
             setCommonUniforms_(CW, CH, roll, -T.first, T.second, 0.0f, 0.0f);

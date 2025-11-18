@@ -1,0 +1,20 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "mthud (gdb)",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/mthud",
+      "cwd": "${workspaceFolder}",
+      "environment": [
+        { "name": "XSENS_SDK_ROOT", "value": "/usr/local/xsens/mt-sdk" },
+        { "name": "LD_LIBRARY_PATH", "value": "/usr/local/xsens/mt-sdk/lib:${env:LD_LIBRARY_PATH}" }
+      ],
+      "MIMode": "gdb",
+      "miDebuggerPath": "/usr/bin/gdb",
+      "externalConsole": false,
+      "stopAtEntry": false
+    }
+  ]
+}

@@ -2,12 +2,27 @@
   "name": "mthud",
   "version-string": "0.1.0",
   "dependencies": [
-    "opencv4[contrib]",
+    {
+      "name": "opencv4",
+      "default-features": false,
+      "features": [
+        "contrib",
+        "highgui",
+        "gtk",
+        "jpeg",
+        "png",
+        "tiff",
+        "webp",
+        "quirc"
+      ]
+    },
     "glfw3",
     "glad",
     "eigen3",
     "nlohmann-json",
+    "freetype",
     "fmt",
     "spdlog"
   ]
 }
+
