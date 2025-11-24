@@ -59,7 +59,7 @@ private:
     // Locking and smoothing
     int lock_id_ = -1;
     bool have_prev_ = false;
-    double ema_alpha_ = 0.4;
+    double ema_alpha_ = 0.0;
     cv::Mat prev_rvec_, prev_tvec_;
 
     BoardPose last_;

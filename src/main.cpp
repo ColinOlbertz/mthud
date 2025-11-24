@@ -7,6 +7,11 @@
 #include <vector>
 #include <cmath>
 #include <optional>
+#include <chrono>
+
+#include <thread>
+#include <mutex>
+#include <atomic>
 
 #include <opencv2/opencv.hpp>
 #include <opencv2/aruco.hpp>
@@ -73,6 +78,7 @@ static bool openCapture(cv::VideoCapture& cap, int index,
     if (w > 0) cap.set(cv::CAP_PROP_FRAME_WIDTH,  w);
     if (h > 0) cap.set(cv::CAP_PROP_FRAME_HEIGHT, h);
     if (fps > 0) cap.set(cv::CAP_PROP_FPS, fps);
+    cap.set(cv::CAP_PROP_BUFFERSIZE, 1);
     cv::Mat probe;
     if (!cap.read(probe) || probe.empty()) return false;
     return true;
@@ -88,6 +94,11 @@ static int parseCamIndex(int argc, char** argv, int fallback = 0) {
     }
     return fallback;
 }
+// ---------- Shared state between render thread (main) and UI thread ----------
+
+static std::atomic<bool> g_running{true};
+static std::mutex        g_camMutex;
+static cv::Mat           g_camPreview;  // last composited camera+HUD frame shown in UI thread
 
 // -------- file-scope constants --------
 namespace {
@@ -96,6 +107,62 @@ namespace {
     constexpr int CANVAS_W = 1920;   // design canvas (4:3)
     constexpr int CANVAS_H = 1440;
 }
+
+// ---------- lightweight frame profiler ----------
+struct FrameClock {
+    using clock = std::chrono::high_resolution_clock;
+    clock::time_point t0, t1, t2, t3, t4, t5;
+
+    // exponential moving averages (ms)
+    double ema_cap   = 0.0;  // capture: grab+retrieve
+    double ema_det   = 0.0;  // detection: aruco update
+    double ema_hom   = 0.0;  // homography math
+    double ema_hud   = 0.0;  // HUD FBO render (+ any readback you still have)
+    double ema_ovl   = 0.0;  // overlay draw + swap
+    double ema_frame = 0.0;  // whole frame
+
+    int frames = 0;
+
+    static double ms(clock::time_point a, clock::time_point b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    }
+    static void ema_update(double& acc, double v) {
+        constexpr double A = 0.20; // smoothing
+        if (acc == 0.0) acc = v;
+        else acc = (1.0 - A) * acc + A * v;
+    }
+
+    inline void begin() { t0 = clock::now(); }
+    inline void stamp_cap_done() { t1 = clock::now(); }
+    inline void stamp_det_done() { t2 = clock::now(); }
+    inline void stamp_hom_done() { t3 = clock::now(); }
+    inline void stamp_hud_done() { t4 = clock::now(); }
+    inline void end_and_log() {
+        t5 = clock::now();
+
+        const double cap   = ms(t0, t1);
+        const double det   = ms(t1, t2);
+        const double hom   = ms(t2, t3);
+        const double hud   = ms(t3, t4);
+        const double ovl   = ms(t4, t5);
+        const double frame = ms(t0, t5);
+
+        ema_update(ema_cap,   cap);
+        ema_update(ema_det,   det);
+        ema_update(ema_hom,   hom);
+        ema_update(ema_hud,   hud);
+        ema_update(ema_ovl,   ovl);
+        ema_update(ema_frame, frame);
+
+        if (++frames % 60 == 0) {
+            const double fps = (ema_frame > 0.0) ? 1000.0 / ema_frame : 0.0;
+            std::fprintf(stderr,
+                "[%5d] FPS %5.1f | cap %6.2f ms  det %6.2f  hom %6.2f  hud %6.2f  ovl %6.2f | frame %6.2f ms\n",
+                frames, fps, ema_cap, ema_det, ema_hom, ema_hud, ema_ovl, ema_frame);
+        }
+    }
+};
+static FrameClock g_clk;
 
 // ---------- GL helpers: minimal textured quad (draws a GL texture fullscreen) ----------
 static GLuint compileShader(GLenum type, const char* src) {
@@ -234,7 +301,195 @@ static Viewport letterbox(int fbw, int fbh, int srcw, int srch) {
     return v;
 }
 
+// ---------- controls + persistence ----------
+//static const char* WIN_CTRL = "HUD Controls"; 
+static const char* PERSIST = "hud_layout_controls.json";
+
+// HUD placement controls
+static int TB_pitch_scale_x1000 = 20;   // manual NDC/deg *1000
+static int TB_pitch_trim_x1000  = 0;    // NDC trim *1000
+static int TB_bank_trim_deg     = 0;    // deg
+static int TB_bank_top_px       = 60;   // px
+static int TB_bank_rad_px       = 220;  // px
+static int TB_ladder_half_px    = 360;  // px
+static int TB_ladder_xoff_px    = 0;    // px
+static int TB_text_scale_pct    = 120;  // %
+static int TB_text_flip_x       = 1;    // 0/1
+static int TB_text_flip_y       = 0;    // 0/1
+
+// Auto pitch scale from camera intrinsics+homography
+static int  TB_auto_pitch_from_cam = 1;   // 0/1
+static int  TB_auto_center_y_px    = -1;  // -1=mid
+static int  TB_probe_dY_canvas     = 100; // px
+
+// ---- Goggles overlay controls (2D SRT applied after HUD warping) ----
+static int TB_gog_show_markers = 1;   // 0/1: draw detected markers in goggles
+static int TB_gog_show_axes    = 1;   // 0/1: draw axes in goggles
+
+// Trackbars can’t be negative; map [0..MAX] -> [-HALF..+HALF]
+static inline int centered(int v, int max) { return v - max/2; }
+
+// Offsets in pixels mapped from 0..2000 => -1000..+1000
+static int TB_ov_off_x_px = 1000;     // centered() => -1000..+1000
+static int TB_ov_off_y_px = 1000;     // centered() => -1000..+1000
+// Zoom range 1..400 % (allows much smaller than before)
+static int TB_ov_scale_pct = 100;     // 1..400
+// Rotation around pivot, 0..360 -> -180..+180
+static int TB_ov_rot_deg   = 180;     // centered() => -180..+180
+static int TB_ov_pitch_deg = 180;
+static int TB_ov_yaw_deg   = 180;
+// Pivot: 0=center (0.5,0.5), 1=top-left (0,0)
+static int TB_ov_pivot_tl  = 0;       // 0/1
+
+
+static void save_controls() {
+    json j{
+        {"pitch_scale_x1000",TB_pitch_scale_x1000},
+        {"pitch_trim_x1000", TB_pitch_trim_x1000},
+        {"bank_trim_deg",    TB_bank_trim_deg},
+        {"bank_top_px",      TB_bank_top_px},
+        {"bank_radius_px",   TB_bank_rad_px},
+        {"ladder_half_px",   TB_ladder_half_px},
+        {"ladder_xoff_px",   TB_ladder_xoff_px},
+        {"text_scale_pct",   TB_text_scale_pct},
+        {"text_flip_x",      TB_text_flip_x},
+        {"text_flip_y",      TB_text_flip_y},
+        {"auto_pitch_from_cam", TB_auto_pitch_from_cam},
+        {"auto_center_y_px", TB_auto_center_y_px},
+        {"probe_dY_canvas",  TB_probe_dY_canvas},
+        {"gog_show_markers", TB_gog_show_markers},
+        {"gog_show_axes",    TB_gog_show_axes},
+        {"ov_off_x_px",    TB_ov_off_x_px},
+        {"ov_off_y_px",    TB_ov_off_y_px},
+        {"ov_scale_pct",    TB_ov_scale_pct},
+        {"ov_rot_deg",    TB_ov_rot_deg},
+        {"ov_pitch_deg",    TB_ov_pitch_deg},
+        {"ov_yaw_deg",    TB_ov_yaw_deg},
+        {"ov_pivot_tl",    TB_ov_pivot_tl}
+        
+
+    };
+    std::ofstream(PERSIST) << j.dump(2);
+}
+static void load_controls() {
+    std::ifstream f(PERSIST); if (!f) return;
+    json j; f >> j;
+    auto get = [&](const char* k, int& v) { if (j.contains(k)) v = j[k].get<int>(); };
+    get("pitch_scale_x1000", TB_pitch_scale_x1000);
+    get("pitch_trim_x1000",  TB_pitch_trim_x1000);
+    get("bank_trim_deg",     TB_bank_trim_deg);
+    get("bank_top_px",       TB_bank_top_px);
+    get("bank_radius_px",    TB_bank_rad_px);
+    get("ladder_half_px",    TB_ladder_half_px);
+    get("ladder_xoff_px",    TB_ladder_xoff_px);
+    get("text_scale_pct",    TB_text_scale_pct);
+    get("text_flip_x",       TB_text_flip_x);
+    get("text_flip_y",       TB_text_flip_y);
+    get("auto_pitch_from_cam", TB_auto_pitch_from_cam);
+    get("auto_center_y_px",    TB_auto_center_y_px);
+    get("probe_dY_canvas",     TB_probe_dY_canvas);
+    get("gog_show_markers",    TB_gog_show_markers);
+    get("gog_show_axes",       TB_gog_show_axes);
+    get("ov_off_x_px",    TB_ov_off_x_px);
+    get("ov_off_y_px",    TB_ov_off_y_px);
+    get("ov_scale_pct",    TB_ov_scale_pct);
+    get("ov_rot_deg",    TB_ov_rot_deg);
+    get("ov_pitch_deg",    TB_ov_pitch_deg);
+    get("ov_yaw_deg",    TB_ov_yaw_deg);
+    get("ov_pivot_tl",    TB_ov_pivot_tl);
+        
+    if (j.contains("pitch_ndc_x1000") && !j.contains("pitch_trim_x1000"))
+        TB_pitch_trim_x1000 = j["pitch_ndc_x1000"].get<int>();
+}
+
 // ---------- helpers ----------
+// ---------- UI: split controls into 2 windows ----------
+
+static void createControlsGroup1()
+{
+    cv::namedWindow("HUD Controls 1", cv::WINDOW_NORMAL);
+    cv::resizeWindow("HUD Controls 1", 420, 600);
+
+    auto tb = [&](const char* name, int* var, int maxv) {
+        cv::createTrackbar(name, "HUD Controls 1", var, maxv, nullptr);
+    };
+
+    // Core HUD geometry + text
+    tb("PitchScale",      &TB_pitch_scale_x1000, 200);
+    tb("PitchTrim",       &TB_pitch_trim_x1000, 1000);
+    tb("BankTrim",        &TB_bank_trim_deg, 60);
+    tb("BankTop_px",      &TB_bank_top_px, 400);
+    tb("BankRadius_px",   &TB_bank_rad_px, 800);
+    tb("LadderHalf_px",   &TB_ladder_half_px, 800);
+    tb("LadderXOffset_px",&TB_ladder_xoff_px, 600);
+    tb("TextScale_pct",   &TB_text_scale_pct, 400);
+    tb("FlipTextX",       &TB_text_flip_x, 1);
+    tb("FlipTextY",       &TB_text_flip_y, 1);
+}
+
+static void createControlsGroup2(int canvasH)
+{
+    cv::namedWindow("HUD Controls 2", cv::WINDOW_NORMAL);
+    cv::resizeWindow("HUD Controls 2", 420, 600);
+
+    auto tb = [&](const char* name, int* var, int maxv) {
+        cv::createTrackbar(name, "HUD Controls 2", var, maxv, nullptr);
+    };
+
+    // Auto pitch calibration + overlay/goggles controls
+    tb("AutoPitch",       &TB_auto_pitch_from_cam, 1);
+    tb("AutoCenterY_px",  &TB_auto_center_y_px, canvasH);
+    tb("AutoProbe_dY",    &TB_probe_dY_canvas, 400);
+
+    tb("ShowMarkers",     &TB_gog_show_markers, 1);
+    tb("ShowAxes",        &TB_gog_show_axes, 1);
+
+    tb("OV_Scale_pct",    &TB_ov_scale_pct, 400);
+    tb("OV_OffX",         &TB_ov_off_x_px, 2000);
+    tb("OV_OffY",         &TB_ov_off_y_px, 2000);
+    tb("OV_Rot_deg",      &TB_ov_rot_deg, 360);
+    tb("OV_Pitch_deg",    &TB_ov_pitch_deg, 360);
+    tb("OV_Yaw_deg",      &TB_ov_yaw_deg, 360);
+    tb("OV_PivotTL",      &TB_ov_pivot_tl, 1);
+}
+// ---------- UI Thread: OpenCV windows + trackbars ----------
+
+static void uiThreadFunc(cv::Size imgSize)
+{
+    // Load persisted control values BEFORE creating sliders
+    load_controls();
+
+    // Camera preview window
+    cv::namedWindow("camera", cv::WINDOW_NORMAL);
+    cv::resizeWindow("camera", imgSize.width, imgSize.height);
+
+    // Two control windows
+    createControlsGroup1();
+    createControlsGroup2(CANVAS_H);
+
+    while (g_running) {
+        cv::Mat preview;
+        {
+            std::lock_guard<std::mutex> lock(g_camMutex);
+            if (!g_camPreview.empty())
+                g_camPreview.copyTo(preview);
+        }
+
+        if (!preview.empty())
+            cv::imshow("camera", preview);
+
+        // process UI events, keep it short to reduce latency
+        int key = cv::waitKey(1);
+        if (key == 27) { // ESC in UI also stops everything
+            g_running = false;
+        }
+    }
+
+    // Save control state on exit
+    save_controls();
+    cv::destroyAllWindows();
+}
+
 static bool loadCalibrationJSON(const std::string& path, cv::Mat& K, cv::Mat& D, cv::Size& size) {
     try {
         cv::FileStorage fs(path, cv::FileStorage::READ | cv::FileStorage::FORMAT_JSON);
@@ -327,8 +582,8 @@ static GLFWwindow* createOverlayWindow(GLFWwindow* shareWith, int desiredMonitor
     }
 
     const GLFWvidmode* mode = glfwGetVideoMode(target);
-    int W = mode ? mode->width : 1280;
-    int H = mode ? mode->height : 720;
+    int W = mode ? mode->width : 2560;
+    int H = mode ? mode->height : 1920;
 
     GLFWwindow* w = glfwCreateWindow(W, H, "HUD Overlay", target, shareWith);
     if (!w) return nullptr;
@@ -343,100 +598,6 @@ static GLFWwindow* createOverlayWindow(GLFWwindow* shareWith, int desiredMonitor
     glfwSwapBuffers(w);
 
     return w;
-}
-
-// ---------- controls + persistence ----------
-static const char* WIN_CTRL = "HUD Controls"; static const char* PERSIST = "hud_layout_controls.json";
-
-// HUD placement controls
-static int TB_pitch_scale_x1000 = 20;   // manual NDC/deg *1000
-static int TB_pitch_trim_x1000  = 0;    // NDC trim *1000
-static int TB_bank_trim_deg     = 0;    // deg
-static int TB_bank_top_px       = 60;   // px
-static int TB_bank_rad_px       = 220;  // px
-static int TB_ladder_half_px    = 360;  // px
-static int TB_ladder_xoff_px    = 0;    // px
-static int TB_text_scale_pct    = 120;  // %
-static int TB_text_flip_x       = 1;    // 0/1
-static int TB_text_flip_y       = 0;    // 0/1
-
-// Auto pitch scale from camera intrinsics+homography
-static int  TB_auto_pitch_from_cam = 1;   // 0/1
-static int  TB_auto_center_y_px    = -1;  // -1=mid
-static int  TB_probe_dY_canvas     = 100; // px
-
-// ---- Goggles overlay controls (2D SRT applied after HUD warping) ----
-static int TB_gog_show_markers = 1;   // 0/1: draw detected markers in goggles
-static int TB_gog_show_axes    = 1;   // 0/1: draw axes in goggles
-
-// Trackbars can’t be negative; map [0..MAX] -> [-HALF..+HALF]
-static inline int centered(int v, int max) { return v - max/2; }
-
-// Offsets in pixels mapped from 0..2000 => -1000..+1000
-static int TB_ov_off_x_px = 1000;     // centered() => -1000..+1000
-static int TB_ov_off_y_px = 1000;     // centered() => -1000..+1000
-// Zoom range 1..400 % (allows much smaller than before)
-static int TB_ov_scale_pct = 100;     // 1..400
-// Rotation around pivot, 0..360 -> -180..+180
-static int TB_ov_rot_deg   = 180;     // centered() => -180..+180
-// Pivot: 0=center (0.5,0.5), 1=top-left (0,0)
-static int TB_ov_pivot_tl  = 0;       // 0/1
-
-
-static void save_controls() {
-    json j{
-        {"pitch_scale_x1000",TB_pitch_scale_x1000},
-        {"pitch_trim_x1000", TB_pitch_trim_x1000},
-        {"bank_trim_deg",    TB_bank_trim_deg},
-        {"bank_top_px",      TB_bank_top_px},
-        {"bank_radius_px",   TB_bank_rad_px},
-        {"ladder_half_px",   TB_ladder_half_px},
-        {"ladder_xoff_px",   TB_ladder_xoff_px},
-        {"text_scale_pct",   TB_text_scale_pct},
-        {"text_flip_x",      TB_text_flip_x},
-        {"text_flip_y",      TB_text_flip_y},
-        {"auto_pitch_from_cam", TB_auto_pitch_from_cam},
-        {"auto_center_y_px", TB_auto_center_y_px},
-        {"probe_dY_canvas",  TB_probe_dY_canvas},
-        {"gog_show_markers", TB_gog_show_markers},
-        {"gog_show_axes",    TB_gog_show_axes},
-        {"ov_off_x_px",    TB_ov_off_x_px},
-        {"ov_off_y_px",    TB_ov_off_y_px},
-        {"ov_scale_pct",    TB_ov_scale_pct},
-        {"ov_rot_deg",    TB_ov_rot_deg},
-        {"ov_pivot_tl",    TB_ov_pivot_tl}
-        
-
-    };
-    std::ofstream(PERSIST) << j.dump(2);
-}
-static void load_controls() {
-    std::ifstream f(PERSIST); if (!f) return;
-    json j; f >> j;
-    auto get = [&](const char* k, int& v) { if (j.contains(k)) v = j[k].get<int>(); };
-    get("pitch_scale_x1000", TB_pitch_scale_x1000);
-    get("pitch_trim_x1000",  TB_pitch_trim_x1000);
-    get("bank_trim_deg",     TB_bank_trim_deg);
-    get("bank_top_px",       TB_bank_top_px);
-    get("bank_radius_px",    TB_bank_rad_px);
-    get("ladder_half_px",    TB_ladder_half_px);
-    get("ladder_xoff_px",    TB_ladder_xoff_px);
-    get("text_scale_pct",    TB_text_scale_pct);
-    get("text_flip_x",       TB_text_flip_x);
-    get("text_flip_y",       TB_text_flip_y);
-    get("auto_pitch_from_cam", TB_auto_pitch_from_cam);
-    get("auto_center_y_px",    TB_auto_center_y_px);
-    get("probe_dY_canvas",     TB_probe_dY_canvas);
-    get("gog_show_markers",    TB_gog_show_markers);
-    get("gog_show_axes",       TB_gog_show_axes);
-    get("ov_off_x_px",    TB_ov_off_x_px);
-    get("ov_off_y_px",    TB_ov_off_y_px);
-    get("ov_scale_pct",    TB_ov_scale_pct);
-    get("ov_rot_deg",    TB_ov_rot_deg);
-    get("ov_pivot_tl",    TB_ov_pivot_tl);
-        
-    if (j.contains("pitch_ndc_x1000") && !j.contains("pitch_trim_x1000"))
-        TB_pitch_trim_x1000 = j["pitch_ndc_x1000"].get<int>();
 }
 
 int main(int argc, char** argv) {
@@ -467,8 +628,14 @@ int main(int argc, char** argv) {
     // Optional MJPG request
     cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M','J','P','G'));
 
-    cv::Mat frame; if (!cap.read(frame) || frame.empty()) { std::cerr << "No frames\n"; return 1; }
+    cv::Mat frame;
+    if (!cap.grab() || !cap.retrieve(frame) || frame.empty()) {
+        std::cerr << "Initial frame empty\n";
+        return 1;
+    }
     cv::Size imgSize = frame.size();
+    // --- Start UI thread (OpenCV camera + trackbars)
+    std::thread uiThread(uiThreadFunc, imgSize);
 
     // --- Calibration
     cv::Mat K, D;
@@ -487,9 +654,6 @@ int main(int argc, char** argv) {
     tracker.setGridBoard(MX, MY, MARKER_LEN, GAP);
     tracker.setAnchorMarkerCorner(0, 0);
     //tracker.setTemporalSmoothing(0.5);
-
-    cv::namedWindow("camera", cv::WINDOW_NORMAL);
-    cv::resizeWindow("camera", imgSize.width, imgSize.height);
 
     // --- Sensor
     auto sensor = makeSensor(); sensor->start();
@@ -585,32 +749,6 @@ int main(int argc, char** argv) {
         recreateOverlayAt(mc > 1 ? 1 : 0);
     }
 
-    // --- Controls
-    cv::namedWindow(WIN_CTRL, cv::WINDOW_NORMAL); cv::resizeWindow(WIN_CTRL, 540, 420);
-    load_controls();
-    auto tb = [&](const char* name, int* var, int maxv) { cv::createTrackbar(name, WIN_CTRL, var, maxv, nullptr); };
-    tb("Pitch scale NDC/deg x1000 (manual)", &TB_pitch_scale_x1000, 200);
-    tb("Pitch trim NDC x1000", &TB_pitch_trim_x1000, 1000);
-    tb("Bank trim deg", &TB_bank_trim_deg, 60);
-    tb("BankTop px", &TB_bank_top_px, 400);
-    tb("BankRadius px", &TB_bank_rad_px, 800);
-    tb("Ladder half width px", &TB_ladder_half_px, 800);
-    tb("Ladder X offset px", &TB_ladder_xoff_px, 600);
-    tb("Text scale %", &TB_text_scale_pct, 400);
-    tb("Flip text X (0/1)", &TB_text_flip_x, 1);
-    tb("Flip text Y (0/1)", &TB_text_flip_y, 1);
-    tb("AUTO pitch from cam (0/1)", &TB_auto_pitch_from_cam, 1);
-    tb("AUTO centerY px (-1=mid)", &TB_auto_center_y_px, CANVAS_H);
-    tb("AUTO probe dY (px)", &TB_probe_dY_canvas, 400);
-    tb("GOG: show markers (0/1)", &TB_gog_show_markers, 1);
-    tb("GOG: show axes (0/1)", &TB_gog_show_axes, 1);
-    tb("OV scale %", &TB_ov_scale_pct, 400);    // min will be clamped in code
-    tb("OV off X (px)",&TB_ov_off_x_px,  2000);   // centered -> -1000..+1000
-    tb("OV off Y (px)",&TB_ov_off_y_px,  2000);
-    tb("OV rot deg",&TB_ov_rot_deg,   360);    // centered -> -180..+180
-    tb("OV pivot TL",&TB_ov_pivot_tl,  1);      // 0=center, 1=top-left
-
-
     // --- Reused CPU mats
     cv::Mat hudWarpBGRA(imgSize, CV_8UC4, cv::Scalar(0, 0, 0, 0));
     cv::Mat hudBGR(imgSize, CV_8UC3);
@@ -621,9 +759,24 @@ int main(int argc, char** argv) {
     double spd_kt_smooth = 0.0, alt_ft_smooth = 0.0;
     bool   first_samples = true;
 
-    while (true) {
-        if (!cap.read(frame) || frame.empty()) break;
+    while (g_running) {
+        g_clk.begin();
+
+        if (!cap.grab()) {
+            std::cerr << "cap.grab() failed\n";
+            break;
+        }
+        if (!cap.retrieve(frame) || frame.empty()) {
+            std::cerr << "cap.retrieve() empty\n";
+            break;
+        }
+
+        g_clk.stamp_cap_done();
+
         tracker.update(frame);
+
+        g_clk.stamp_det_done();
+
         BoardPose pose = tracker.latest();
 
         // --- Compute homography early (so scale applies to BOTH camera and goggles)
@@ -631,10 +784,53 @@ int main(int argc, char** argv) {
         std::vector<cv::Point2f> bb_img;
 
         if (pose.valid) {
+            // 3D billboard in board coordinates (a 4:3 rectangle)
             std::vector<cv::Point3f> bb_obj;
             const float BOARD_W_M = 0.24f; // must match warping board width
             buildBillboardPts4x3({0,0,0}, BOARD_W_M, bb_obj);
 
+            // --- Apply manual yaw / pitch offsets to the HUD plane (board-local)
+            // Trackbar values are [0..360]; map them to [-180..+180] degrees
+            const float yaw_deg   = float(centered(TB_ov_yaw_deg,   360));
+            const float pitch_deg = float(centered(TB_ov_pitch_deg, 360));
+
+            if (std::fabs(yaw_deg) > 0.001f || std::fabs(pitch_deg) > 0.001f) {
+                const float yaw   = yaw_deg   * float(CV_PI / 180.0);
+                const float pitch = pitch_deg * float(CV_PI / 180.0);
+
+                const float cy = std::cos(yaw),   sy = std::sin(yaw);
+                const float cp = std::cos(pitch), sp = std::sin(pitch);
+
+                // Yaw around board Y axis, pitch around board X axis
+                cv::Matx33f R_y(  cy, 0.0f,  sy,
+                                0.0f, 1.0f, 0.0f,
+                                -sy, 0.0f,  cy );
+
+                cv::Matx33f R_x( 1.0f, 0.0f, 0.0f,
+                                0.0f,  cp, -sp,
+                                0.0f,  sp,  cp );
+
+                cv::Matx33f R_off = R_y * R_x;
+
+                // Rotate billboard around its centre, not the corner
+                cv::Point3f c(0,0,0);
+                for (const auto& p : bb_obj) {
+                    c.x += p.x; c.y += p.y; c.z += p.z;
+                }
+                c.x /= static_cast<float>(bb_obj.size());
+                c.y /= static_cast<float>(bb_obj.size());
+                c.z /= static_cast<float>(bb_obj.size());
+
+                for (auto& p : bb_obj) {
+                    cv::Vec3f v(p.x - c.x, p.y - c.y, p.z - c.z);
+                    cv::Vec3f v2 = R_off * v;
+                    p.x = c.x + v2[0];
+                    p.y = c.y + v2[1];
+                    p.z = c.z + v2[2];
+                }
+            }
+
+            // Project the (optionally rotated) HUD rectangle into the camera
             cv::projectPoints(bb_obj, pose.rvec, pose.tvec, K, D, bb_img);
 
             // src HUD quad (FBO) → dst image quad (TR,TL,BL,BR → TL,TR,BR,BL)
@@ -650,6 +846,7 @@ int main(int argc, char** argv) {
             Hh.convertTo(Hh64, CV_64F);
             haveH = true;
         }
+        g_clk.stamp_hom_done();
 
         // --- Build camera viz base (for preview only)
         cv::Mat camera = frame.clone();
@@ -781,6 +978,8 @@ int main(int argc, char** argv) {
         hud.draw(hs);
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
+        g_clk.stamp_hud_done();
+
         // Read back FBO to CPU (BGRA)
         glBindFramebuffer(GL_FRAMEBUFFER, hudFBO);
         glPixelStorei(GL_PACK_ALIGNMENT, 4);
@@ -882,7 +1081,7 @@ int main(int argc, char** argv) {
 
 
         // ---- Show camera preview (with composite)
-        cv::imshow("camera", camera);
+        // cv::imshow("camera", camera);
         int k = cv::waitKey(1);
         if (k == 27) break;
 
@@ -984,6 +1183,9 @@ int main(int argc, char** argv) {
             ovQuad.draw(hudWarpTex);
 
             glfwSwapBuffers(hudOverlay);
+
+            g_clk.end_and_log();
+
             glfwMakeContextCurrent(win);
         }
 
@@ -997,6 +1199,12 @@ int main(int argc, char** argv) {
         int VW = int(CANVAS_W * scale), VH = int(CANVAS_H * scale);
         int VX = (W - VW) / 2, VY = (H - VH) / 2;
 
+        {
+            // hand the composited frame to the UI thread for display
+            std::lock_guard<std::mutex> lock(g_camMutex);
+            g_camPreview = camera.clone();
+        }
+
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         glViewport(VX, VY, VW, VH);
         glClearColor(0, 0, 0, 1);
@@ -1004,10 +1212,17 @@ int main(int argc, char** argv) {
         hud.draw(hs);
         glfwSwapBuffers(win);
 
-        if (glfwWindowShouldClose(win)) break;
+        // Allow GL window close to terminate the app
+        if (glfwWindowShouldClose(win)) {
+            g_running = false;
+            break;
+}
     }
 
     save_controls();
+    g_running = false;
+    if (uiThread.joinable()) uiThread.join();
+
     if (hudOverlay) {
         glfwMakeContextCurrent(hudOverlay);
         ovQuad.shutdown();
