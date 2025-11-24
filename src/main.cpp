@@ -29,6 +29,8 @@ using nlohmann::json;
 
 static const float PI = 3.14159265358979323846f;
 
+static const float HINV_ID[9] = { 1,0,0,  0,1,0,  0,0,1 };
+
 //--------------------- linux vs windows cam setup --------------------------------
 #ifdef __linux__
   #include <fcntl.h>
@@ -94,6 +96,177 @@ static int parseCamIndex(int argc, char** argv, int fallback = 0) {
     }
     return fallback;
 }
+
+// ===== GPU warp: HUD-only -> image space via inverse homography =====
+struct GpuWarp {
+    GLuint prog=0, vao=0, vbo=0;
+    GLint uHud=-1, uHinv=-1, uHudSize=-1, uImgSize=-1, uAlpha=-1, uSRT = -1;
+
+    static GLuint sh(GLenum t, const char* s){
+        GLuint x=glCreateShader(t); glShaderSource(x,1,&s,nullptr); glCompileShader(x);
+        GLint ok=0; glGetShaderiv(x,GL_COMPILE_STATUS,&ok);
+        if(!ok){ char log[2048]; glGetShaderInfoLog(x,2048,nullptr,log); std::cerr<<"shader: "<<log<<"\n"; }
+        return x;
+    }
+    static GLuint link(GLuint vs, GLuint fs){
+        GLuint p=glCreateProgram(); glAttachShader(p,vs); glAttachShader(p,fs); glLinkProgram(p);
+        GLint ok=0; glGetProgramiv(p,GL_LINK_STATUS,&ok);
+        if(!ok){ char log[2048]; glGetProgramInfoLog(p,2048,nullptr,log); std::cerr<<"link: "<<log<<"\n"; }
+        glDeleteShader(vs); glDeleteShader(fs); return p;
+    }
+    bool init(){
+        const char* vs = R"(#version 330 core
+            layout(location=0) in vec2 aPos; out vec2 vPos;
+            void main(){ vPos = aPos*0.5 + 0.5; gl_Position = vec4(aPos,0,1); })";
+        const char* fs = R"(#version 330 core
+            in vec2 vPos; out vec4 FragColor;
+            uniform sampler2D uHud;
+            uniform mat3  uHinv;     // image px -> hud px
+            uniform mat3  uSRT;      // HUD-pixel SRT from sliders
+            uniform vec2  uHudSize;
+            uniform vec2  uImgSize;
+            uniform float uAlpha;
+            void main(){
+                // vPos is 0..1 in the current viewport
+                // Flip Y: OpenCV image uses top-left origin, GL uses bottom-left
+                vec2 p_img = vec2(vPos.x * uImgSize.x, (1.0 - vPos.y) * uImgSize.y);
+
+                // Map image px -> HUD px, then apply slider SRT in HUD-pixel space
+                vec3 q = uSRT * (uHinv * vec3(p_img, 1.0));
+
+                // PERSPECTIVE DIVIDE (this was missing)
+                float w = (q.z != 0.0) ? q.z : 1e-6;
+                vec2 uv = (q.xy / w) / uHudSize;
+
+                // Clip outside HUD canvas
+                if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+                    FragColor = vec4(0.0);
+                    return;
+                }
+
+                vec4 c = texture(uHud, uv);
+                FragColor = vec4(c.rgb, c.a * uAlpha);
+        })";
+        GLuint v=sh(GL_VERTEX_SHADER,vs), f=sh(GL_FRAGMENT_SHADER,fs);
+        prog = link(v,f); if(!prog) return false;
+        uHud     = glGetUniformLocation(prog,"uHud");
+        uHinv    = glGetUniformLocation(prog,"uHinv");
+        uHudSize = glGetUniformLocation(prog,"uHudSize");
+        uImgSize = glGetUniformLocation(prog,"uImgSize");
+        uAlpha   = glGetUniformLocation(prog,"uAlpha");
+        uSRT    = glGetUniformLocation(prog,"uSRT");
+
+        glGenVertexArrays(1,&vao); glGenBuffers(1,&vbo);
+        glBindVertexArray(vao); glBindBuffer(GL_ARRAY_BUFFER,vbo);
+        const float tri[12] = { -1,-1,  1,-1,  1, 1,   -1,-1,  1,1,  -1,1 };
+        glBufferData(GL_ARRAY_BUFFER,sizeof(tri),tri,GL_STATIC_DRAW);
+        glVertexAttribPointer(0,2,GL_FLOAT,GL_FALSE,2*sizeof(float),(void*)0);
+        glEnableVertexAttribArray(0);
+        glBindVertexArray(0);
+        return true;
+    }
+    void draw(GLuint hudTex, const float Hinv[9], const float SRT[9], int imgW,int imgH, int hudW,int hudH, float alpha){
+        glUseProgram(prog);
+        glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, hudTex);
+        glUniform1i(uHud,0);
+        glUniformMatrix3fv(uHinv,1,GL_FALSE,Hinv);
+        glUniformMatrix3fv(uSRT, 1,GL_FALSE,SRT);
+        glUniform2f(uHudSize,(float)hudW,(float)hudH);
+        glUniform2f(uImgSize,(float)imgW,(float)imgH);
+        glUniform1f(uAlpha,alpha);
+        glBindVertexArray(vao);
+        glDrawArrays(GL_TRIANGLES,0,6);
+        glBindVertexArray(0);
+        glUseProgram(0);
+    }
+};
+
+// ===== GPU composite: camera + HUD (HUD sampled via inverse homography) =====
+struct GpuComposite {
+    GLuint prog=0, vao=0, vbo=0;
+    GLint uCam=-1, uHud=-1, uHinv=-1, uHudSize=-1, uImgSize=-1, uSRT = -1;
+
+    static GLuint sh(GLenum t, const char* s){
+        GLuint x=glCreateShader(t); glShaderSource(x,1,&s,nullptr); glCompileShader(x);
+        GLint ok=0; glGetShaderiv(x,GL_COMPILE_STATUS,&ok);
+        if(!ok){ char log[2048]; glGetShaderInfoLog(x,2048,nullptr,log); std::cerr<<"shader: "<<log<<"\n"; }
+        return x;
+    }
+    static GLuint link(GLuint vs, GLuint fs){
+        GLuint p=glCreateProgram(); glAttachShader(p,vs); glAttachShader(p,fs); glLinkProgram(p);
+        GLint ok=0; glGetProgramiv(p,GL_LINK_STATUS,&ok);
+        if(!ok){ char log[2048]; glGetProgramInfoLog(p,2048,nullptr,log); std::cerr<<"link: "<<log<<"\n"; }
+        glDeleteShader(vs); glDeleteShader(fs); return p;
+    }
+    bool init(){
+        const char* vs = R"(#version 330 core
+            layout(location=0) in vec2 aPos; out vec2 vPos;
+            void main(){ vPos = aPos*0.5 + 0.5; gl_Position = vec4(aPos,0,1); })";
+        const char* fs = R"(#version 330 core
+            in vec2 vPos; out vec4 FragColor;
+            uniform sampler2D uCam;
+            uniform sampler2D uHud;
+            uniform mat3  uHinv;
+            uniform mat3  uSRT;
+            uniform vec2  uHudSize;
+            uniform vec2  uImgSize;
+            void main(){
+                // Camera sample (flip Y so it’s upright)
+                vec3 cam = texture(uCam, vec2(vPos.x, 1.0 - vPos.y)).rgb;
+
+                // Map viewport sample -> image px (Y flipped)
+                vec2 p_img = vec2(vPos.x * uImgSize.x, (1.0 - vPos.y) * uImgSize.y);
+
+                // image px -> HUD px, then slider SRT
+                vec3 q = uSRT * (uHinv * vec3(p_img, 1.0));
+
+                // PERSPECTIVE DIVIDE (this was missing)
+                float w = (q.z != 0.0) ? q.z : 1e-6;
+                vec2 uv = (q.xy / w) / uHudSize;
+
+                if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+                    FragColor = vec4(cam, 1.0);  // out of HUD canvas => camera only
+                    return;
+                }
+
+                vec4 hud = texture(uHud, uv);
+                FragColor = vec4(mix(cam, hud.rgb, hud.a), 1.0);
+            })";
+        GLuint v=sh(GL_VERTEX_SHADER,vs), f=sh(GL_FRAGMENT_SHADER,fs);
+        prog = link(v,f); if(!prog) return false;
+
+        uCam     = glGetUniformLocation(prog,"uCam");
+        uHud     = glGetUniformLocation(prog,"uHud");
+        uHinv    = glGetUniformLocation(prog,"uHinv");
+        uHudSize = glGetUniformLocation(prog,"uHudSize");
+        uImgSize = glGetUniformLocation(prog,"uImgSize");
+        uSRT    = glGetUniformLocation(prog,"uSRT");
+
+        glGenVertexArrays(1,&vao); glGenBuffers(1,&vbo);
+        glBindVertexArray(vao); glBindBuffer(GL_ARRAY_BUFFER,vbo);
+        const float tri[12] = { -1,-1,  1,-1,  1, 1,   -1,-1,  1,1,  -1,1 };
+        glBufferData(GL_ARRAY_BUFFER,sizeof(tri),tri,GL_STATIC_DRAW);
+        glVertexAttribPointer(0,2,GL_FLOAT,GL_FALSE,2*sizeof(float),(void*)0);
+        glEnableVertexAttribArray(0);
+        glBindVertexArray(0);
+        return true;
+    }
+    void draw(GLuint camTex, GLuint hudTex, const float Hinv[9], const float SRT[9],
+              int imgW,int imgH, int hudW,int hudH){
+        glUseProgram(prog);
+        glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, camTex); glUniform1i(uCam,0);
+        glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, hudTex); glUniform1i(uHud,1);
+        glUniformMatrix3fv(uHinv,1,GL_FALSE,Hinv);
+        glUniformMatrix3fv(uSRT, 1,GL_FALSE,SRT);
+        glUniform2f(uHudSize,(float)hudW,(float)hudH);
+        glUniform2f(uImgSize,(float)imgW,(float)imgH);
+        glBindVertexArray(vao);
+        glDrawArrays(GL_TRIANGLES,0,6);
+        glBindVertexArray(0);
+        glUseProgram(0);
+    }
+};
+
 // ---------- Shared state between render thread (main) and UI thread ----------
 
 static std::atomic<bool> g_running{true};
@@ -165,6 +338,52 @@ struct FrameClock {
 static FrameClock g_clk;
 
 // ---------- GL helpers: minimal textured quad (draws a GL texture fullscreen) ----------
+
+// Trackbars can’t be negative; map [0..MAX] -> [-HALF..+HALF]
+static inline int centered(int v, int max) { return v - max/2; }
+
+static void buildSRT_px(float SRT_out[9],
+                        int TB_off_x_px, int TB_off_y_px,
+                        int TB_scale_pct, int TB_rot_deg,
+                        int TB_pivot_tl,  // 1=top-left, 0=center
+                        int hudW, int hudH)
+{
+    // offsets in pixels: 0..2000 -> [-1000..+1000]
+    const double dx = (double)centered(TB_off_x_px, 2000);
+    const double dy = (double)centered(TB_off_y_px, 2000);
+
+    // scale: 1..400 % -> 0.01..4.00
+    const double s  = std::max(0.01, TB_scale_pct / 100.0);
+
+    // rotation in radians: 0..360 -> [-180..+180]
+    const double rot = centered(TB_rot_deg, 360) * (CV_PI/180.0);
+
+    const double cx = (TB_pivot_tl ? 0.0 : 0.5 * hudW);
+    const double cy = (TB_pivot_tl ? 0.0 : 0.5 * hudH);
+
+    const double c = std::cos(rot), sn = std::sin(rot);
+
+    // Column-major 3x3 (to match GLSL when GL_FALSE for transpose):
+    // SRT = T(cx+dx, cy+dy) * R(rot) * S(s) * T(-cx, -cy)
+    const double T1[9] = {1,0,0,  0,1,0,  -cx,-cy,1};
+    const double  R[9] = {c,sn,0, -sn,c,0,  0,0,1};
+    const double  S[9] = {s,0,0,  0,s,0,  0,0,1};
+    const double T2[9] = {1,0,0,  0,1,0,  cx+dx,cy+dy,1};
+
+    auto mul = [](const double A[9], const double B[9], double C[9]){
+        // column-major mat mul: C = A * B
+        for(int j=0;j<3;++j) for(int i=0;i<3;++i){
+            C[j*3+i] = A[0*3+i]*B[j*3+0] + A[1*3+i]*B[j*3+1] + A[2*3+i]*B[j*3+2];
+        }
+    };
+    double RS[9], RS_T1[9], T2_RS_T1[9];
+    mul(R, S, RS);
+    mul(RS, T1, RS_T1);
+    mul(T2, RS_T1, T2_RS_T1);
+
+    for(int k=0;k<9;++k) SRT_out[k] = (float)T2_RS_T1[k];
+}
+
 static GLuint compileShader(GLenum type, const char* src) {
     GLuint s = glCreateShader(type);
     glShaderSource(s, 1, &src, nullptr);
@@ -325,9 +544,6 @@ static int  TB_probe_dY_canvas     = 100; // px
 // ---- Goggles overlay controls (2D SRT applied after HUD warping) ----
 static int TB_gog_show_markers = 1;   // 0/1: draw detected markers in goggles
 static int TB_gog_show_axes    = 1;   // 0/1: draw axes in goggles
-
-// Trackbars can’t be negative; map [0..MAX] -> [-HALF..+HALF]
-static inline int centered(int v, int max) { return v - max/2; }
 
 // Offsets in pixels mapped from 0..2000 => -1000..+1000
 static int TB_ov_off_x_px = 1000;     // centered() => -1000..+1000
@@ -589,7 +805,7 @@ static GLFWwindow* createOverlayWindow(GLFWwindow* shareWith, int desiredMonitor
     if (!w) return nullptr;
 
     glfwMakeContextCurrent(w);
-    glfwSwapInterval(1);       // vsync on the glasses
+    glfwSwapInterval(0);       // vsync on the glasses
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
@@ -603,6 +819,10 @@ static GLFWwindow* createOverlayWindow(GLFWwindow* shareWith, int desiredMonitor
 int main(int argc, char** argv) {
     // --- Camera
     int camIndex = parseCamIndex(argc, argv, /*fallback*/0);
+
+    cv::setUseOptimized(true);
+    cv::setNumThreads(6);      // often best for ArUco; test 2..6
+
 
     cv::VideoCapture cap;
     if (!openCapture(cap, camIndex, 1280, 720, 30)) {
@@ -670,7 +890,22 @@ int main(int argc, char** argv) {
     if (!win) { std::cerr << "glfwCreateWindow failed\n"; glfwTerminate(); return 1; }
     glfwMakeContextCurrent(win);
     if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) { std::cerr << "glad load failed\n"; return 1; }
-    glfwSwapInterval(1);
+    glfwSwapInterval(0);
+
+    // --- Dedicated CAMERA window (GPU composite target)
+    GLFWwindow* camWin = glfwCreateWindow(imgSize.width, imgSize.height, "Camera", nullptr, win /*share ctx*/);
+    if (!camWin) {
+        std::cerr << "glfwCreateWindow(Camera) failed\n";
+    } else {
+        glfwMakeContextCurrent(camWin);
+        glfwSwapInterval(0);   // unsynced: lower latency
+        glClearColor(0,0,0,1);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glfwSwapBuffers(camWin);
+        glfwMakeContextCurrent(win); // back to HUD
+    }
+
+
 
     // --- Offscreen HUD render target (FBO + texture)
     GLuint hudFBO = 0, hudTex = 0;
@@ -679,24 +914,32 @@ int main(int argc, char** argv) {
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, HUD_TEX_W, HUD_TEX_H, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glGenFramebuffers(1, &hudFBO);
     glBindFramebuffer(GL_FRAMEBUFFER, hudFBO);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, hudTex, 0);
     if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) std::cerr << "HUD FBO incomplete\n";
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
-    // Readback buffer for FBO
-    cv::Mat hudBGRA(HUD_TEX_H, HUD_TEX_W, CV_8UC4);
+    // GPU warp & composite programs
+    GpuWarp warp;
+    GpuComposite comp;
+    if (!warp.init()) std::cerr << "GpuWarp init failed\n";
+    if (!comp.init()) std::cerr << "GpuComposite init failed\n";
 
-    // Texture to hold warped HUD in camera space (uploaded to goggles)
-    GLuint hudWarpTex = 0;
-    glGenTextures(1, &hudWarpTex);
-    glBindTexture(GL_TEXTURE_2D, hudWarpTex);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, imgSize.width, imgSize.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    // Camera texture (BGR upload)
+    GLuint camTex = 0;
+    glGenTextures(1, &camTex);
+    glBindTexture(GL_TEXTURE_2D, camTex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, imgSize.width, imgSize.height, 0, GL_BGR, GL_UNSIGNED_BYTE, nullptr);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    // Readback buffer for FBO
+    cv::Mat hudBGRA(HUD_TEX_H, HUD_TEX_W, CV_8UC4);
 
     // --- Renderer
     HudRenderer hud; if (!hud.init()) { std::cerr << "hud.init failed\n"; return 1; }
@@ -709,7 +952,7 @@ int main(int argc, char** argv) {
     auto recreateOverlayAt = [&](int idx) {
         if (hudOverlay) {
             glfwMakeContextCurrent(hudOverlay);
-            glFinish();
+            //glFinish();
             ovQuad.shutdown();
             glfwDestroyWindow(hudOverlay);
             hudOverlay = nullptr;
@@ -730,7 +973,7 @@ int main(int argc, char** argv) {
             return;
         }
         glfwMakeContextCurrent(hudOverlay);
-        glfwSwapInterval(1);
+        glfwSwapInterval(0);
         if (!ovQuad.init()) {
             std::cerr << "Overlay TexQuad init failed; overlay disabled\n";
             glfwMakeContextCurrent(win);
@@ -846,6 +1089,30 @@ int main(int argc, char** argv) {
             Hh.convertTo(Hh64, CV_64F);
             haveH = true;
         }
+
+        cv::Mat Hinv64;
+        float HinvGL[9] = {0};
+        if (haveH) {
+            cv::invert(Hh64, Hinv64);
+            HinvGL[0] = (float)Hinv64.at<double>(0,0);
+            HinvGL[1] = (float)Hinv64.at<double>(1,0);
+            HinvGL[2] = (float)Hinv64.at<double>(2,0);
+            HinvGL[3] = (float)Hinv64.at<double>(0,1);
+            HinvGL[4] = (float)Hinv64.at<double>(1,1);
+            HinvGL[5] = (float)Hinv64.at<double>(2,1);
+            HinvGL[6] = (float)Hinv64.at<double>(0,2);
+            HinvGL[7] = (float)Hinv64.at<double>(1,2);
+            HinvGL[8] = (float)Hinv64.at<double>(2,2);
+        }
+
+        float SRTGL[9];
+        buildSRT_px(SRTGL,
+                    TB_ov_off_x_px, TB_ov_off_y_px,
+                    TB_ov_scale_pct, TB_ov_rot_deg,
+                    TB_ov_pivot_tl,
+                    HUD_TEX_W, HUD_TEX_H);
+
+
         g_clk.stamp_hom_done();
 
         // --- Build camera viz base (for preview only)
@@ -972,6 +1239,7 @@ int main(int argc, char** argv) {
         if (f9 == GLFW_RELEASE) f9Latch = false;
 
         glBindFramebuffer(GL_FRAMEBUFFER, hudFBO);
+        glActiveTexture(GL_TEXTURE0);
         glViewport(0, 0, HUD_TEX_W, HUD_TEX_H);
         glClearColor(0.f, 0.f, 0.f, 0.f);
         glClear(GL_COLOR_BUFFER_BIT);
@@ -980,105 +1248,40 @@ int main(int argc, char** argv) {
 
         g_clk.stamp_hud_done();
 
-        // Read back FBO to CPU (BGRA)
-        glBindFramebuffer(GL_FRAMEBUFFER, hudFBO);
-        glPixelStorei(GL_PACK_ALIGNMENT, 4);
-        glReadPixels(0, 0, HUD_TEX_W, HUD_TEX_H, GL_BGRA, GL_UNSIGNED_BYTE, hudBGRA.data);
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        if (camWin) {
+            glfwMakeContextCurrent(camWin);
 
-        // ---- CAMERA COMPOSITE + GOGGLES TEXTURE UPLOAD (reuse early homography)
-        if (haveH) {
-            // Warp HUD FBO → image space
-            hudWarpBGRA.setTo(cv::Scalar(0,0,0,0));
-            cv::warpPerspective(hudBGRA, hudWarpBGRA, Hh64, camera.size(),
-                                cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0,0,0,0));
+            int cw=0, ch=0; glfwGetFramebufferSize(camWin, &cw, &ch);
+            Viewport cvp = letterbox(cw, ch, imgSize.width, imgSize.height);
+            glViewport(cvp.x, cvp.y, cvp.w, cvp.h);
 
-            // ----- GOGGLES-ONLY DEBUG OVERLAYS (draw on 3-channel view)
-            if ((TB_gog_show_markers && !tracker.ids().empty()) || TB_gog_show_axes) {
-                cv::Mat hudWarpBGR;
-                cv::cvtColor(hudWarpBGRA, hudWarpBGR, cv::COLOR_BGRA2BGR);  // drop alpha for drawing
+            glClearColor(0,0,0,1);
+            glClear(GL_COLOR_BUFFER_BIT);
 
-                if (TB_gog_show_markers && !tracker.ids().empty()) {
-                    cv::aruco::drawDetectedMarkers(hudWarpBGR, tracker.corners(), tracker.ids());
-                }
-                if (TB_gog_show_axes) {
-                    float A = MARKER_LEN * 0.7f;
-                    std::vector<cv::Point3f> axisPts = { {0,0,0},{A,0,0},{0,A,0},{0,0,A} };
-                    std::vector<cv::Point2f> ip;
-                    cv::projectPoints(axisPts, pose.rvec, pose.tvec, K, D, ip);
-                    auto lineAA = [&](int a, int b, const cv::Scalar& c) {
-                        cv::line(hudWarpBGR, ip[a], ip[b], c, 2, cv::LINE_AA);  // thickness=2; adjust if desired
-                    };
-                    // BGR colors
-                    lineAA(0, 1, cv::Scalar(0,   0, 255)); // X red
-                    lineAA(0, 2, cv::Scalar(0, 255,   0)); // Y green
-                    lineAA(0, 3, cv::Scalar(255, 0,   0)); // Z blue
-                }
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
-                // Copy BGR back into BGRA, keep original alpha
-                std::vector<cv::Mat> chBGRA; cv::split(hudWarpBGRA, chBGRA); // BGRA
-                std::vector<cv::Mat> chBGR;  cv::split(hudWarpBGR,  chBGR);  // BGR
-                chBGRA[0] = chBGR[0];
-                chBGRA[1] = chBGR[1];
-                chBGRA[2] = chBGR[2];
-                cv::merge(chBGRA, hudWarpBGRA);
-            }
+            static const float HINV_ID[9] = {1,0,0,  0,1,0,  0,0,1};
+            const float* Hx = haveH ? HinvGL : HINV_ID;
 
-            // Alpha blend for camera preview (unchanged)
-            std::vector<cv::Mat> ch; cv::split(hudWarpBGRA, ch);
-            cv::merge(std::vector<cv::Mat>{ch[0], ch[1], ch[2]}, hudBGR);
-            ch[3].convertTo(alpha, CV_32F, 1.0/255.0);
-            cv::merge(std::vector<cv::Mat>{alpha, alpha, alpha}, a3);
+            // We'll pass SRT below in Part 2; for now pass identitySRT
+            static const float SRT_ID[9] = {1,0,0,  0,1,0,  0,0,1};
 
-            camera.convertTo(camF, CV_32F);
-            hudBGR.convertTo(hudF, CV_32F);
-            cv::multiply(hudF, a3, hudF);
-            cv::multiply(camF, cv::Scalar(1,1,1) - a3, camF);
-            cv::Mat outF = hudF + camF; outF.convertTo(camera, CV_8U);
+            comp.draw(
+                /*camTex=*/camTex,
+                /*hudTex=*/hudTex,
+                /*Hinv=*/Hx,
+                /*SRT =*/SRTGL,
+                /*imgW=*/imgSize.width, /*imgH=*/imgSize.height,
+                /*hudW=*/HUD_TEX_W,     /*hudH=*/HUD_TEX_H);
 
-            // ----- GOGGLES-ONLY DEBUG OVERLAYS (draw on 3-channel view, then restore alpha)
-            if ((TB_gog_show_markers && !tracker.ids().empty()) || TB_gog_show_axes) {
-                cv::Mat hudWarpBGR;
-                cv::cvtColor(hudWarpBGRA, hudWarpBGR, cv::COLOR_BGRA2BGR);  // drop alpha for drawing
+            glfwSwapBuffers(camWin);
 
-                if (TB_gog_show_markers && !tracker.ids().empty()) {
-                    cv::aruco::drawDetectedMarkers(hudWarpBGR, tracker.corners(), tracker.ids());
-                }
-                if (TB_gog_show_axes) {
-                    const float A = MARKER_LEN * 0.7f;
-                    std::vector<cv::Point3f> axisPts = { {0,0,0},{A,0,0},{0,A,0},{0,0,A} };
-                    std::vector<cv::Point2f> ip;
-                    cv::projectPoints(axisPts, pose.rvec, pose.tvec, K, D, ip);
-                    auto lineAA = [&](int a, int b, const cv::Scalar& c) {
-                        cv::line(hudWarpBGR, ip[a], ip[b], c, 2, cv::LINE_AA);
-                    };
-                    lineAA(0,1,{0,0,255});
-                    lineAA(0,2,{0,255,0});
-                    lineAA(0,3,{255,0,0});
-                }
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, 0);
 
-                // Copy BGR back into BGRA, keep original alpha
-                std::vector<cv::Mat> chBGRA; cv::split(hudWarpBGRA, chBGRA); // BGRA
-                std::vector<cv::Mat> chBGR;  cv::split(hudWarpBGR,  chBGR);  // BGR
-                chBGRA[0] = chBGR[0];
-                chBGRA[1] = chBGR[1];
-                chBGRA[2] = chBGR[2];
-                cv::merge(chBGRA, hudWarpBGRA);
-            }
-
-            // Upload warped HUD to goggles texture
-            glBindTexture(GL_TEXTURE_2D, hudWarpTex);
-            glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, imgSize.width, imgSize.height,
-                            GL_BGRA, GL_UNSIGNED_BYTE, hudWarpBGRA.data);
-        } else {
-            // no pose: clear goggles texture
-            static std::vector<uint8_t> zero(imgSize.width*imgSize.height*4, 0);
-            glBindTexture(GL_TEXTURE_2D, hudWarpTex);
-            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, imgSize.width, imgSize.height,
-                            GL_RGBA, GL_UNSIGNED_BYTE, zero.data());
+            glfwMakeContextCurrent(win);
         }
-
 
         // ---- Show camera preview (with composite)
         // cv::imshow("camera", camera);
@@ -1151,40 +1354,43 @@ int main(int argc, char** argv) {
         if (hudOverlay){
             glfwMakeContextCurrent(hudOverlay);
             int fbw=0, fbh=0; glfwGetFramebufferSize(hudOverlay,&fbw,&fbh);
-            glBindFramebuffer(GL_FRAMEBUFFER,0);
-            glDisable(GL_DEPTH_TEST); glDisable(GL_CULL_FACE); glDisable(GL_STENCIL_TEST);
-            glViewport(0,0,fbw,fbh);
-            glClearColor(0.f,0.f,0.f,1.f);
-            glClear(GL_COLOR_BUFFER_BIT);
+            // glBindFramebuffer(GL_FRAMEBUFFER,0);
+            // glDisable(GL_DEPTH_TEST); glDisable(GL_CULL_FACE); glDisable(GL_STENCIL_TEST);
+            // glViewport(0,0,fbw,fbh);
+            // glClearColor(0.f,0.f,0.f,1.f);
+            // glClear(GL_COLOR_BUFFER_BIT);
 
             Viewport vp = letterbox(fbw, fbh, imgSize.width, imgSize.height);
 
-            // Compute SRT parameters from trackbars:
-            // scale: at least 1% (0.01) to allow “way smaller than 100%”
-            float scale = std::max(0.01f, TB_ov_scale_pct / 100.0f);
-            // offsets: convert pixels within the letterboxed viewport to UV units
-            int offXpx = centered(TB_ov_off_x_px, 2000); // -1000..+1000 px
-            int offYpx = centered(TB_ov_off_y_px, 2000);
-            // UV origin for GL is bottom-left; our quad UV has (0,0)=top-left.
-            // Because we built UVs as (0,1)…(1,0), mapping +Y pixels up requires negative UV Y.
-            float offUVx = (vp.w > 0) ? (float(offXpx) / float(vp.w)) : 0.f;
-            float offUVy = (vp.h > 0) ? (-float(offYpx) / float(vp.h)) : 0.f; // note sign
-
-            // rotation in radians
-            float rotRad = float(centered(TB_ov_rot_deg, 360) * (CV_PI/180.0));
-
-            // pivot
-            float pivotX = (TB_ov_pivot_tl ? 0.0f : 0.5f);
-            float pivotY = (TB_ov_pivot_tl ? 0.0f : 0.5f);
-
+            // Draw HUD into the overlay using inverse homography on the GPU
             glViewport(vp.x, vp.y, vp.w, vp.h);
-            ovQuad.setSRT(scale, scale, offUVx, offUVy, rotRad, pivotX, pivotY);
 
-            ovQuad.draw(hudWarpTex);
+            // Transparent clear is harmless here; leave as-is if you prefer black
+            glClearColor(0,0,0,0);
+            glClear(GL_COLOR_BUFFER_BIT);
 
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+            // If no pose this frame, show nothing (alpha=0). With a valid pose draw HUD at full alpha.
+            if (haveH) {
+                warp.draw(
+                    /*hudTex=*/hudTex,
+                    /*Hinv=*/HinvGL,         /*sliders*/SRTGL,
+                    /*imgW=*/imgSize.width,  /*imgH=*/imgSize.height,
+                    /*hudW=*/HUD_TEX_W,      /*hudH=*/HUD_TEX_H,
+                    /*alpha=*/1.0f
+                );
+
+            } else {
+                // Optional: leave cleared (transparent) when pose is invalid
+            }
+
+            // Present the overlay
             glfwSwapBuffers(hudOverlay);
 
-            g_clk.end_and_log();
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, 0);
 
             glfwMakeContextCurrent(win);
         }
@@ -1199,12 +1405,6 @@ int main(int argc, char** argv) {
         int VW = int(CANVAS_W * scale), VH = int(CANVAS_H * scale);
         int VX = (W - VW) / 2, VY = (H - VH) / 2;
 
-        {
-            // hand the composited frame to the UI thread for display
-            std::lock_guard<std::mutex> lock(g_camMutex);
-            g_camPreview = camera.clone();
-        }
-
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         glViewport(VX, VY, VW, VH);
         glClearColor(0, 0, 0, 1);
@@ -1212,11 +1412,19 @@ int main(int argc, char** argv) {
         hud.draw(hs);
         glfwSwapBuffers(win);
 
+        {
+            // hand the composited frame to the UI thread for display
+            std::lock_guard<std::mutex> lock(g_camMutex);
+            g_camPreview = camera.clone();
+        }
+
         // Allow GL window close to terminate the app
         if (glfwWindowShouldClose(win)) {
             g_running = false;
             break;
-}
+        }
+
+        g_clk.end_and_log();
     }
 
     save_controls();
@@ -1229,7 +1437,7 @@ int main(int argc, char** argv) {
         glfwMakeContextCurrent(win);
         glfwDestroyWindow(hudOverlay);
     }
-    if (hudWarpTex) glDeleteTextures(1,&hudWarpTex);
+    if (camTex) glDeleteTextures(1,&camTex);
     if (hudTex)     glDeleteTextures(1,&hudTex);
     if (hudFBO)     glDeleteFramebuffers(1,&hudFBO);
 
