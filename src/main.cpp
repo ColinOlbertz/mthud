@@ -448,12 +448,12 @@ struct OverlayTexQuad {
 
         const float verts[] = {
             //  pos.xy   uv.xy
-            -1.f,-1.f,  0.f,1.f,
-             1.f,-1.f,  1.f,1.f,
-             1.f, 1.f,  1.f,0.f,
-            -1.f,-1.f,  0.f,1.f,
-             1.f, 1.f,  1.f,0.f,
-            -1.f, 1.f,  0.f,0.f
+            -1.f,-1.f,  0.f,0.f,
+             1.f,-1.f,  1.f,0.f,
+             1.f, 1.f,  1.f,1.f,
+            -1.f,-1.f,  0.f,0.f,
+             1.f, 1.f,  1.f,1.f,
+            -1.f, 1.f,  0.f,1.f
         };
         glGenVertexArrays(1, &vao);
         glGenBuffers(1, &vbo);
@@ -892,21 +892,6 @@ int main(int argc, char** argv) {
     if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) { std::cerr << "glad load failed\n"; return 1; }
     glfwSwapInterval(0);
 
-    // --- Dedicated CAMERA window (GPU composite target)
-    GLFWwindow* camWin = glfwCreateWindow(imgSize.width, imgSize.height, "Camera", nullptr, win /*share ctx*/);
-    if (!camWin) {
-        std::cerr << "glfwCreateWindow(Camera) failed\n";
-    } else {
-        glfwMakeContextCurrent(camWin);
-        glfwSwapInterval(0);   // unsynced: lower latency
-        glClearColor(0,0,0,1);
-        glClear(GL_COLOR_BUFFER_BIT);
-        glfwSwapBuffers(camWin);
-        glfwMakeContextCurrent(win); // back to HUD
-    }
-
-
-
     // --- Offscreen HUD render target (FBO + texture)
     GLuint hudFBO = 0, hudTex = 0;
     glGenTextures(1, &hudTex);
@@ -924,25 +909,18 @@ int main(int argc, char** argv) {
 
     // GPU warp & composite programs
     GpuWarp warp;
-    GpuComposite comp;
     if (!warp.init()) std::cerr << "GpuWarp init failed\n";
-    if (!comp.init()) std::cerr << "GpuComposite init failed\n";
-
-    // Camera texture (BGR upload)
-    GLuint camTex = 0;
-    glGenTextures(1, &camTex);
-    glBindTexture(GL_TEXTURE_2D, camTex);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, imgSize.width, imgSize.height, 0, GL_BGR, GL_UNSIGNED_BYTE, nullptr);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-
-    // Readback buffer for FBO
-    cv::Mat hudBGRA(HUD_TEX_H, HUD_TEX_W, CV_8UC4);
 
     // --- Renderer
     HudRenderer hud; if (!hud.init()) { std::cerr << "hud.init failed\n"; return 1; }
+
+    // Use the FBO texture for the dev preview instead of redrawing the HUD a second time
+    OverlayTexQuad previewQuad;
+    if (!previewQuad.init()) {
+        std::cerr << "Preview quad init failed\n";
+    } else {
+        previewQuad.setSRT(1.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.5f, 0.5f);
+    }
 
     // --- Overlay window for goggles + textured quad
     GLFWwindow* hudOverlay = nullptr;
@@ -991,12 +969,6 @@ int main(int argc, char** argv) {
         int mc = 0; glfwGetMonitors(&mc);
         recreateOverlayAt(mc > 1 ? 1 : 0);
     }
-
-    // --- Reused CPU mats
-    cv::Mat hudWarpBGRA(imgSize, CV_8UC4, cv::Scalar(0, 0, 0, 0));
-    cv::Mat hudBGR(imgSize, CV_8UC3);
-    cv::Mat alpha(imgSize, CV_32F), a3(imgSize, CV_32FC3);
-    cv::Mat camF(imgSize, CV_32FC3), hudF(imgSize, CV_32FC3);
 
     // --- smoothing state
     double spd_kt_smooth = 0.0, alt_ft_smooth = 0.0;
@@ -1116,7 +1088,7 @@ int main(int argc, char** argv) {
         g_clk.stamp_hom_done();
 
         // --- Build camera viz base (for preview only)
-        cv::Mat camera = frame.clone();
+        cv::Mat camera = frame; // reuse captured buffer to avoid an extra clone
         if (!tracker.ids().empty())
             cv::aruco::drawDetectedMarkers(camera, tracker.corners(), tracker.ids());
         if (pose.valid) {
@@ -1248,40 +1220,7 @@ int main(int argc, char** argv) {
 
         g_clk.stamp_hud_done();
 
-        if (camWin) {
-            glfwMakeContextCurrent(camWin);
-
-            int cw=0, ch=0; glfwGetFramebufferSize(camWin, &cw, &ch);
-            Viewport cvp = letterbox(cw, ch, imgSize.width, imgSize.height);
-            glViewport(cvp.x, cvp.y, cvp.w, cvp.h);
-
-            glClearColor(0,0,0,1);
-            glClear(GL_COLOR_BUFFER_BIT);
-
-            glEnable(GL_BLEND);
-            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-
-            static const float HINV_ID[9] = {1,0,0,  0,1,0,  0,0,1};
-            const float* Hx = haveH ? HinvGL : HINV_ID;
-
-            // We'll pass SRT below in Part 2; for now pass identitySRT
-            static const float SRT_ID[9] = {1,0,0,  0,1,0,  0,0,1};
-
-            comp.draw(
-                /*camTex=*/camTex,
-                /*hudTex=*/hudTex,
-                /*Hinv=*/Hx,
-                /*SRT =*/SRTGL,
-                /*imgW=*/imgSize.width, /*imgH=*/imgSize.height,
-                /*hudW=*/HUD_TEX_W,     /*hudH=*/HUD_TEX_H);
-
-            glfwSwapBuffers(camWin);
-
-            glActiveTexture(GL_TEXTURE0);
-            glBindTexture(GL_TEXTURE_2D, 0);
-
-            glfwMakeContextCurrent(win);
-        }
+        // GPU composite window removed; camera preview stays in the OpenCV UI
 
         // ---- Show camera preview (with composite)
         // cv::imshow("camera", camera);
@@ -1409,13 +1348,21 @@ int main(int argc, char** argv) {
         glViewport(VX, VY, VW, VH);
         glClearColor(0, 0, 0, 1);
         glClear(GL_COLOR_BUFFER_BIT);
-        hud.draw(hs);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        if (previewQuad.prog) {
+            previewQuad.draw(hudTex);
+        } else {
+            hud.draw(hs); // fallback if the preview shader failed
+        }
         glfwSwapBuffers(win);
 
         {
-            // hand the composited frame to the UI thread for display
-            std::lock_guard<std::mutex> lock(g_camMutex);
-            g_camPreview = camera.clone();
+            // hand the composited frame to the UI thread for display (skip if UI is busy)
+            std::unique_lock<std::mutex> lock(g_camMutex, std::try_to_lock);
+            if (lock.owns_lock()) {
+                g_camPreview = camera.clone();
+            }
         }
 
         // Allow GL window close to terminate the app
@@ -1437,7 +1384,7 @@ int main(int argc, char** argv) {
         glfwMakeContextCurrent(win);
         glfwDestroyWindow(hudOverlay);
     }
-    if (camTex) glDeleteTextures(1,&camTex);
+    previewQuad.shutdown();
     if (hudTex)     glDeleteTextures(1,&hudTex);
     if (hudFBO)     glDeleteFramebuffers(1,&hudFBO);
 
