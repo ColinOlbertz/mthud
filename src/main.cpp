@@ -21,6 +21,7 @@
 #include <GLFW/glfw3.h>
 #include <nlohmann/json.hpp>
 
+#include "app.hpp"
 #include "aruco_tracker.hpp"
 #include "hud_renderer.hpp"
 #include "sensor.hpp"
@@ -30,6 +31,13 @@ using nlohmann::json;
 static const float PI = 3.14159265358979323846f;
 
 static const float HINV_ID[9] = { 1,0,0,  0,1,0,  0,0,1 };
+
+// ---- detector ring buffer + latest pose (definitions matching app.hpp)
+std::array<cv::Mat,3> g_grayBuf;
+std::atomic<int>      g_wr{-1};
+std::atomic<bool>     g_detRun{true};
+std::mutex            g_poseMtx;
+BoardPose             g_pose;   // starts invalid; tracker will fill
 
 //--------------------- linux vs windows cam setup --------------------------------
 #ifdef __linux__
@@ -97,176 +105,6 @@ static int parseCamIndex(int argc, char** argv, int fallback = 0) {
     return fallback;
 }
 
-// ===== GPU warp: HUD-only -> image space via inverse homography =====
-struct GpuWarp {
-    GLuint prog=0, vao=0, vbo=0;
-    GLint uHud=-1, uHinv=-1, uHudSize=-1, uImgSize=-1, uAlpha=-1, uSRT = -1;
-
-    static GLuint sh(GLenum t, const char* s){
-        GLuint x=glCreateShader(t); glShaderSource(x,1,&s,nullptr); glCompileShader(x);
-        GLint ok=0; glGetShaderiv(x,GL_COMPILE_STATUS,&ok);
-        if(!ok){ char log[2048]; glGetShaderInfoLog(x,2048,nullptr,log); std::cerr<<"shader: "<<log<<"\n"; }
-        return x;
-    }
-    static GLuint link(GLuint vs, GLuint fs){
-        GLuint p=glCreateProgram(); glAttachShader(p,vs); glAttachShader(p,fs); glLinkProgram(p);
-        GLint ok=0; glGetProgramiv(p,GL_LINK_STATUS,&ok);
-        if(!ok){ char log[2048]; glGetProgramInfoLog(p,2048,nullptr,log); std::cerr<<"link: "<<log<<"\n"; }
-        glDeleteShader(vs); glDeleteShader(fs); return p;
-    }
-    bool init(){
-        const char* vs = R"(#version 330 core
-            layout(location=0) in vec2 aPos; out vec2 vPos;
-            void main(){ vPos = aPos*0.5 + 0.5; gl_Position = vec4(aPos,0,1); })";
-        const char* fs = R"(#version 330 core
-            in vec2 vPos; out vec4 FragColor;
-            uniform sampler2D uHud;
-            uniform mat3  uHinv;     // image px -> hud px
-            uniform mat3  uSRT;      // HUD-pixel SRT from sliders
-            uniform vec2  uHudSize;
-            uniform vec2  uImgSize;
-            uniform float uAlpha;
-            void main(){
-                // vPos is 0..1 in the current viewport
-                // Flip Y: OpenCV image uses top-left origin, GL uses bottom-left
-                vec2 p_img = vec2(vPos.x * uImgSize.x, (1.0 - vPos.y) * uImgSize.y);
-
-                // Map image px -> HUD px, then apply slider SRT in HUD-pixel space
-                vec3 q = uSRT * (uHinv * vec3(p_img, 1.0));
-
-                // PERSPECTIVE DIVIDE (this was missing)
-                float w = (q.z != 0.0) ? q.z : 1e-6;
-                vec2 uv = (q.xy / w) / uHudSize;
-
-                // Clip outside HUD canvas
-                if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
-                    FragColor = vec4(0.0);
-                    return;
-                }
-
-                vec4 c = texture(uHud, uv);
-                FragColor = vec4(c.rgb, c.a * uAlpha);
-        })";
-        GLuint v=sh(GL_VERTEX_SHADER,vs), f=sh(GL_FRAGMENT_SHADER,fs);
-        prog = link(v,f); if(!prog) return false;
-        uHud     = glGetUniformLocation(prog,"uHud");
-        uHinv    = glGetUniformLocation(prog,"uHinv");
-        uHudSize = glGetUniformLocation(prog,"uHudSize");
-        uImgSize = glGetUniformLocation(prog,"uImgSize");
-        uAlpha   = glGetUniformLocation(prog,"uAlpha");
-        uSRT    = glGetUniformLocation(prog,"uSRT");
-
-        glGenVertexArrays(1,&vao); glGenBuffers(1,&vbo);
-        glBindVertexArray(vao); glBindBuffer(GL_ARRAY_BUFFER,vbo);
-        const float tri[12] = { -1,-1,  1,-1,  1, 1,   -1,-1,  1,1,  -1,1 };
-        glBufferData(GL_ARRAY_BUFFER,sizeof(tri),tri,GL_STATIC_DRAW);
-        glVertexAttribPointer(0,2,GL_FLOAT,GL_FALSE,2*sizeof(float),(void*)0);
-        glEnableVertexAttribArray(0);
-        glBindVertexArray(0);
-        return true;
-    }
-    void draw(GLuint hudTex, const float Hinv[9], const float SRT[9], int imgW,int imgH, int hudW,int hudH, float alpha){
-        glUseProgram(prog);
-        glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, hudTex);
-        glUniform1i(uHud,0);
-        glUniformMatrix3fv(uHinv,1,GL_FALSE,Hinv);
-        glUniformMatrix3fv(uSRT, 1,GL_FALSE,SRT);
-        glUniform2f(uHudSize,(float)hudW,(float)hudH);
-        glUniform2f(uImgSize,(float)imgW,(float)imgH);
-        glUniform1f(uAlpha,alpha);
-        glBindVertexArray(vao);
-        glDrawArrays(GL_TRIANGLES,0,6);
-        glBindVertexArray(0);
-        glUseProgram(0);
-    }
-};
-
-// ===== GPU composite: camera + HUD (HUD sampled via inverse homography) =====
-struct GpuComposite {
-    GLuint prog=0, vao=0, vbo=0;
-    GLint uCam=-1, uHud=-1, uHinv=-1, uHudSize=-1, uImgSize=-1, uSRT = -1;
-
-    static GLuint sh(GLenum t, const char* s){
-        GLuint x=glCreateShader(t); glShaderSource(x,1,&s,nullptr); glCompileShader(x);
-        GLint ok=0; glGetShaderiv(x,GL_COMPILE_STATUS,&ok);
-        if(!ok){ char log[2048]; glGetShaderInfoLog(x,2048,nullptr,log); std::cerr<<"shader: "<<log<<"\n"; }
-        return x;
-    }
-    static GLuint link(GLuint vs, GLuint fs){
-        GLuint p=glCreateProgram(); glAttachShader(p,vs); glAttachShader(p,fs); glLinkProgram(p);
-        GLint ok=0; glGetProgramiv(p,GL_LINK_STATUS,&ok);
-        if(!ok){ char log[2048]; glGetProgramInfoLog(p,2048,nullptr,log); std::cerr<<"link: "<<log<<"\n"; }
-        glDeleteShader(vs); glDeleteShader(fs); return p;
-    }
-    bool init(){
-        const char* vs = R"(#version 330 core
-            layout(location=0) in vec2 aPos; out vec2 vPos;
-            void main(){ vPos = aPos*0.5 + 0.5; gl_Position = vec4(aPos,0,1); })";
-        const char* fs = R"(#version 330 core
-            in vec2 vPos; out vec4 FragColor;
-            uniform sampler2D uCam;
-            uniform sampler2D uHud;
-            uniform mat3  uHinv;
-            uniform mat3  uSRT;
-            uniform vec2  uHudSize;
-            uniform vec2  uImgSize;
-            void main(){
-                // Camera sample (flip Y so it’s upright)
-                vec3 cam = texture(uCam, vec2(vPos.x, 1.0 - vPos.y)).rgb;
-
-                // Map viewport sample -> image px (Y flipped)
-                vec2 p_img = vec2(vPos.x * uImgSize.x, (1.0 - vPos.y) * uImgSize.y);
-
-                // image px -> HUD px, then slider SRT
-                vec3 q = uSRT * (uHinv * vec3(p_img, 1.0));
-
-                // PERSPECTIVE DIVIDE (this was missing)
-                float w = (q.z != 0.0) ? q.z : 1e-6;
-                vec2 uv = (q.xy / w) / uHudSize;
-
-                if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
-                    FragColor = vec4(cam, 1.0);  // out of HUD canvas => camera only
-                    return;
-                }
-
-                vec4 hud = texture(uHud, uv);
-                FragColor = vec4(mix(cam, hud.rgb, hud.a), 1.0);
-            })";
-        GLuint v=sh(GL_VERTEX_SHADER,vs), f=sh(GL_FRAGMENT_SHADER,fs);
-        prog = link(v,f); if(!prog) return false;
-
-        uCam     = glGetUniformLocation(prog,"uCam");
-        uHud     = glGetUniformLocation(prog,"uHud");
-        uHinv    = glGetUniformLocation(prog,"uHinv");
-        uHudSize = glGetUniformLocation(prog,"uHudSize");
-        uImgSize = glGetUniformLocation(prog,"uImgSize");
-        uSRT    = glGetUniformLocation(prog,"uSRT");
-
-        glGenVertexArrays(1,&vao); glGenBuffers(1,&vbo);
-        glBindVertexArray(vao); glBindBuffer(GL_ARRAY_BUFFER,vbo);
-        const float tri[12] = { -1,-1,  1,-1,  1, 1,   -1,-1,  1,1,  -1,1 };
-        glBufferData(GL_ARRAY_BUFFER,sizeof(tri),tri,GL_STATIC_DRAW);
-        glVertexAttribPointer(0,2,GL_FLOAT,GL_FALSE,2*sizeof(float),(void*)0);
-        glEnableVertexAttribArray(0);
-        glBindVertexArray(0);
-        return true;
-    }
-    void draw(GLuint camTex, GLuint hudTex, const float Hinv[9], const float SRT[9],
-              int imgW,int imgH, int hudW,int hudH){
-        glUseProgram(prog);
-        glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, camTex); glUniform1i(uCam,0);
-        glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, hudTex); glUniform1i(uHud,1);
-        glUniformMatrix3fv(uHinv,1,GL_FALSE,Hinv);
-        glUniformMatrix3fv(uSRT, 1,GL_FALSE,SRT);
-        glUniform2f(uHudSize,(float)hudW,(float)hudH);
-        glUniform2f(uImgSize,(float)imgW,(float)imgH);
-        glBindVertexArray(vao);
-        glDrawArrays(GL_TRIANGLES,0,6);
-        glBindVertexArray(0);
-        glUseProgram(0);
-    }
-};
-
 // ---------- Shared state between render thread (main) and UI thread ----------
 
 static std::atomic<bool> g_running{true};
@@ -281,108 +119,7 @@ namespace {
     constexpr int CANVAS_H = 1440;
 }
 
-// ---------- lightweight frame profiler ----------
-struct FrameClock {
-    using clock = std::chrono::high_resolution_clock;
-    clock::time_point t0, t1, t2, t3, t4, t5;
-
-    // exponential moving averages (ms)
-    double ema_cap   = 0.0;  // capture: grab+retrieve
-    double ema_det   = 0.0;  // detection: aruco update
-    double ema_hom   = 0.0;  // homography math
-    double ema_hud   = 0.0;  // HUD FBO render (+ any readback you still have)
-    double ema_ovl   = 0.0;  // overlay draw + swap
-    double ema_frame = 0.0;  // whole frame
-
-    int frames = 0;
-
-    static double ms(clock::time_point a, clock::time_point b) {
-        return std::chrono::duration<double, std::milli>(b - a).count();
-    }
-    static void ema_update(double& acc, double v) {
-        constexpr double A = 0.20; // smoothing
-        if (acc == 0.0) acc = v;
-        else acc = (1.0 - A) * acc + A * v;
-    }
-
-    inline void begin() { t0 = clock::now(); }
-    inline void stamp_cap_done() { t1 = clock::now(); }
-    inline void stamp_det_done() { t2 = clock::now(); }
-    inline void stamp_hom_done() { t3 = clock::now(); }
-    inline void stamp_hud_done() { t4 = clock::now(); }
-    inline void end_and_log() {
-        t5 = clock::now();
-
-        const double cap   = ms(t0, t1);
-        const double det   = ms(t1, t2);
-        const double hom   = ms(t2, t3);
-        const double hud   = ms(t3, t4);
-        const double ovl   = ms(t4, t5);
-        const double frame = ms(t0, t5);
-
-        ema_update(ema_cap,   cap);
-        ema_update(ema_det,   det);
-        ema_update(ema_hom,   hom);
-        ema_update(ema_hud,   hud);
-        ema_update(ema_ovl,   ovl);
-        ema_update(ema_frame, frame);
-
-        if (++frames % 60 == 0) {
-            const double fps = (ema_frame > 0.0) ? 1000.0 / ema_frame : 0.0;
-            std::fprintf(stderr,
-                "[%5d] FPS %5.1f | cap %6.2f ms  det %6.2f  hom %6.2f  hud %6.2f  ovl %6.2f | frame %6.2f ms\n",
-                frames, fps, ema_cap, ema_det, ema_hom, ema_hud, ema_ovl, ema_frame);
-        }
-    }
-};
-static FrameClock g_clk;
-
-// ---------- GL helpers: minimal textured quad (draws a GL texture fullscreen) ----------
-
-// Trackbars can’t be negative; map [0..MAX] -> [-HALF..+HALF]
-static inline int centered(int v, int max) { return v - max/2; }
-
-static void buildSRT_px(float SRT_out[9],
-                        int TB_off_x_px, int TB_off_y_px,
-                        int TB_scale_pct, int TB_rot_deg,
-                        int TB_pivot_tl,  // 1=top-left, 0=center
-                        int hudW, int hudH)
-{
-    // offsets in pixels: 0..2000 -> [-1000..+1000]
-    const double dx = (double)centered(TB_off_x_px, 2000);
-    const double dy = (double)centered(TB_off_y_px, 2000);
-
-    // scale: 1..400 % -> 0.01..4.00
-    const double s  = std::max(0.01, TB_scale_pct / 100.0);
-
-    // rotation in radians: 0..360 -> [-180..+180]
-    const double rot = centered(TB_rot_deg, 360) * (CV_PI/180.0);
-
-    const double cx = (TB_pivot_tl ? 0.0 : 0.5 * hudW);
-    const double cy = (TB_pivot_tl ? 0.0 : 0.5 * hudH);
-
-    const double c = std::cos(rot), sn = std::sin(rot);
-
-    // Column-major 3x3 (to match GLSL when GL_FALSE for transpose):
-    // SRT = T(cx+dx, cy+dy) * R(rot) * S(s) * T(-cx, -cy)
-    const double T1[9] = {1,0,0,  0,1,0,  -cx,-cy,1};
-    const double  R[9] = {c,sn,0, -sn,c,0,  0,0,1};
-    const double  S[9] = {s,0,0,  0,s,0,  0,0,1};
-    const double T2[9] = {1,0,0,  0,1,0,  cx+dx,cy+dy,1};
-
-    auto mul = [](const double A[9], const double B[9], double C[9]){
-        // column-major mat mul: C = A * B
-        for(int j=0;j<3;++j) for(int i=0;i<3;++i){
-            C[j*3+i] = A[0*3+i]*B[j*3+0] + A[1*3+i]*B[j*3+1] + A[2*3+i]*B[j*3+2];
-        }
-    };
-    double RS[9], RS_T1[9], T2_RS_T1[9];
-    mul(R, S, RS);
-    mul(RS, T1, RS_T1);
-    mul(T2, RS_T1, T2_RS_T1);
-
-    for(int k=0;k<9;++k) SRT_out[k] = (float)T2_RS_T1[k];
-}
+FrameClock clk;
 
 static GLuint compileShader(GLenum type, const char* src) {
     GLuint s = glCreateShader(type);
@@ -500,25 +237,6 @@ struct OverlayTexQuad {
         prog = vao = vbo = 0;
     }
 };
-
-
-struct Viewport { int x, y, w, h; };
-static Viewport letterbox(int fbw, int fbh, int srcw, int srch) {
-    if (fbw <= 0 || fbh <= 0 || srcw <= 0 || srch <= 0) return {0,0,fbw,fbh};
-    const double wndA = double(fbw) / double(fbh);
-    const double srcA = double(srcw) / double(srch);
-    Viewport v{};
-    if (wndA >= srcA) { // pillarbox
-        v.h = fbh;
-        v.w = int(fbh * srcA + 0.5);
-        v.x = (fbw - v.w) / 2; v.y = 0;
-    } else {            // letterbox
-        v.w = fbw;
-        v.h = int(fbw / srcA + 0.5);
-        v.x = 0; v.y = (fbh - v.h) / 2;
-    }
-    return v;
-}
 
 // ---------- controls + persistence ----------
 //static const char* WIN_CTRL = "HUD Controls"; 
@@ -817,22 +535,32 @@ static GLFWwindow* createOverlayWindow(GLFWwindow* shareWith, int desiredMonitor
 }
 
 int main(int argc, char** argv) {
+    // --- Sensor first (claim the serial port before hammering USB cameras)
+    struct SensorRunner {
+        std::unique_ptr<ISensorSource> ptr;
+        SensorRunner() : ptr(makeSensor()) { if (ptr) ptr->start(); }
+        ~SensorRunner() { if (ptr) ptr->stop(); }
+        ISensorSource* operator->() { return ptr.get(); }
+        const ISensorSource* operator->() const { return ptr.get(); }
+    } sensor;
+
     // --- Camera
     int camIndex = parseCamIndex(argc, argv, /*fallback*/0);
 
     cv::setUseOptimized(true);
+    cv::setUseOpenVX(false);
     cv::setNumThreads(6);      // often best for ArUco; test 2..6
 
 
     cv::VideoCapture cap;
-    if (!openCapture(cap, camIndex, 1280, 720, 30)) {
+    if (!openCapture(cap, camIndex, 1280, 720, 60)) {
         auto avail = scanCameras(12);
         if (avail.empty()) {
             std::cerr << "No camera could be opened.\n";
             return 1;
         }
         camIndex = avail.front();
-        if (!openCapture(cap, camIndex, 1280, 720, 30)) {
+        if (!openCapture(cap, camIndex, 1280, 720, 60)) {
             std::cerr << "Failed to open first available camera.\n";
             return 1;
         }
@@ -854,6 +582,10 @@ int main(int argc, char** argv) {
         return 1;
     }
     cv::Size imgSize = frame.size();
+
+    for (auto& b : g_grayBuf)
+    b.create(imgSize.height, imgSize.width, CV_8UC1);
+
     // --- Start UI thread (OpenCV camera + trackbars)
     std::thread uiThread(uiThreadFunc, imgSize);
 
@@ -870,13 +602,42 @@ int main(int argc, char** argv) {
     ArucoTracking tracker;
     const int MX = 3, MY = 2;
     const float MARKER_LEN = 0.050f, GAP = 0.012f;
-    tracker.setCameraIntrinsics(K, D);
-    tracker.setGridBoard(MX, MY, MARKER_LEN, GAP);
-    tracker.setAnchorMarkerCorner(0, 0);
-    //tracker.setTemporalSmoothing(0.5);
+    std::thread detThread([&]{
+        cv::Mat localGray;
+        int last = -1;
 
-    // --- Sensor
-    auto sensor = makeSensor(); sensor->start();
+        // Optional: detector params / downscale tuned for speed
+        tracker.setCameraIntrinsics(K, D);
+        tracker.setGridBoard(MX, MY, MARKER_LEN, GAP);
+        tracker.setAnchorMarkerCorner(0, 0);
+        tracker.setTemporalSmoothing(0.9);
+
+        // tracker.setDownscale(cfg.downscale_pct); // e.g. 0.75
+        // cv::aruco::DetectorParameters p = ...; tracker.setParams(p);
+
+        while (g_detRun.load(std::memory_order_acquire)) {
+            // Spin/wait for a new published index
+            int idx = g_wr.load(std::memory_order_acquire);
+            if (idx == last) { 
+                std::this_thread::yield(); 
+                continue; 
+            }
+            last = idx;
+
+            // Copy the published gray frame into a private Mat
+            g_grayBuf[idx].copyTo(localGray);
+
+            // Run detection (heavy)
+            tracker.update(localGray);
+
+            // Publish latest pose
+            BoardPose p = tracker.latest();
+            {
+                std::lock_guard<std::mutex> lk(g_poseMtx);
+                g_pose = p;
+            }
+        }
+    });
 
     // --- GLFW init
     if (!glfwInit()) { std::cerr << "glfwInit failed\n"; return 1; }
@@ -893,17 +654,17 @@ int main(int argc, char** argv) {
     glfwSwapInterval(0);
 
     // --- Dedicated CAMERA window (GPU composite target)
-    GLFWwindow* camWin = glfwCreateWindow(imgSize.width, imgSize.height, "Camera", nullptr, win /*share ctx*/);
-    if (!camWin) {
-        std::cerr << "glfwCreateWindow(Camera) failed\n";
-    } else {
-        glfwMakeContextCurrent(camWin);
-        glfwSwapInterval(0);   // unsynced: lower latency
-        glClearColor(0,0,0,1);
-        glClear(GL_COLOR_BUFFER_BIT);
-        glfwSwapBuffers(camWin);
-        glfwMakeContextCurrent(win); // back to HUD
-    }
+    // GLFWwindow* camWin = glfwCreateWindow(imgSize.width, imgSize.height, "Camera", nullptr, win /*share ctx*/);
+    // if (!camWin) {
+    //     std::cerr << "glfwCreateWindow(Camera) failed\n";
+    // } else {
+    //     glfwMakeContextCurrent(camWin);
+    //     glfwSwapInterval(0);   // unsynced: lower latency
+    //     glClearColor(0,0,0,1);
+    //     glClear(GL_COLOR_BUFFER_BIT);
+    //     glfwSwapBuffers(camWin);
+    //     glfwMakeContextCurrent(win); // back to HUD
+    // }
 
 
 
@@ -1003,7 +764,7 @@ int main(int argc, char** argv) {
     bool   first_samples = true;
 
     while (g_running) {
-        g_clk.begin();
+        clk.begin();
 
         if (!cap.grab()) {
             std::cerr << "cap.grab() failed\n";
@@ -1014,13 +775,22 @@ int main(int argc, char** argv) {
             break;
         }
 
-        g_clk.stamp_cap_done();
+        clk.cap();
 
-        tracker.update(frame);
+        // Publish gray to the detector ring buffer
+        int next = (g_wr.load(std::memory_order_relaxed) + 1) % 3;
+        frame.copyTo(g_grayBuf[next]);                          // reuse preallocated slot
+        g_wr.store(next, std::memory_order_release);
+        //tracker.update(gray);
+        BoardPose pose;
+        {
+            std::lock_guard<std::mutex> lk(g_poseMtx);
+            pose = g_pose;     // cheap copy
+        }
 
-        g_clk.stamp_det_done();
+        clk.det();
 
-        BoardPose pose = tracker.latest();
+        //BoardPose pose = tracker.latest();
 
         // --- Compute homography early (so scale applies to BOTH camera and goggles)
         cv::Mat Hh64; bool haveH = false;
@@ -1113,7 +883,7 @@ int main(int argc, char** argv) {
                     HUD_TEX_W, HUD_TEX_H);
 
 
-        g_clk.stamp_hom_done();
+        clk.hom();
 
         // --- Build camera viz base (for preview only)
         cv::Mat camera = frame.clone();
@@ -1246,42 +1016,42 @@ int main(int argc, char** argv) {
         hud.draw(hs);
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
-        g_clk.stamp_hud_done();
+        clk.hud();
 
-        if (camWin) {
-            glfwMakeContextCurrent(camWin);
+        // if (camWin) {
+        //     glfwMakeContextCurrent(camWin);
 
-            int cw=0, ch=0; glfwGetFramebufferSize(camWin, &cw, &ch);
-            Viewport cvp = letterbox(cw, ch, imgSize.width, imgSize.height);
-            glViewport(cvp.x, cvp.y, cvp.w, cvp.h);
+        //     int cw=0, ch=0; glfwGetFramebufferSize(camWin, &cw, &ch);
+        //     Viewport cvp = letterbox(cw, ch, imgSize.width, imgSize.height);
+        //     glViewport(cvp.x, cvp.y, cvp.w, cvp.h);
 
-            glClearColor(0,0,0,1);
-            glClear(GL_COLOR_BUFFER_BIT);
+        //     glClearColor(0,0,0,1);
+        //     glClear(GL_COLOR_BUFFER_BIT);
 
-            glEnable(GL_BLEND);
-            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        //     glEnable(GL_BLEND);
+        //     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
-            static const float HINV_ID[9] = {1,0,0,  0,1,0,  0,0,1};
-            const float* Hx = haveH ? HinvGL : HINV_ID;
+        //     static const float HINV_ID[9] = {1,0,0,  0,1,0,  0,0,1};
+        //     const float* Hx = haveH ? HinvGL : HINV_ID;
 
-            // We'll pass SRT below in Part 2; for now pass identitySRT
-            static const float SRT_ID[9] = {1,0,0,  0,1,0,  0,0,1};
+        //     // We'll pass SRT below in Part 2; for now pass identitySRT
+        //     //static const float SRT_ID[9] = {1,0,0,  0,1,0,  0,0,1};
 
-            comp.draw(
-                /*camTex=*/camTex,
-                /*hudTex=*/hudTex,
-                /*Hinv=*/Hx,
-                /*SRT =*/SRTGL,
-                /*imgW=*/imgSize.width, /*imgH=*/imgSize.height,
-                /*hudW=*/HUD_TEX_W,     /*hudH=*/HUD_TEX_H);
+        //     comp.draw(
+        //         /*camTex=*/camTex,
+        //         /*hudTex=*/hudTex,
+        //         /*Hinv=*/Hx,
+        //         /*SRT =*/SRTGL,
+        //         /*imgW=*/imgSize.width, /*imgH=*/imgSize.height,
+        //         /*hudW=*/HUD_TEX_W,     /*hudH=*/HUD_TEX_H);
 
-            glfwSwapBuffers(camWin);
+        //     glfwSwapBuffers(camWin);
 
-            glActiveTexture(GL_TEXTURE0);
-            glBindTexture(GL_TEXTURE_2D, 0);
+        //     glActiveTexture(GL_TEXTURE0);
+        //     glBindTexture(GL_TEXTURE_2D, 0);
 
-            glfwMakeContextCurrent(win);
-        }
+        //     glfwMakeContextCurrent(win);
+        // }
 
         // ---- Show camera preview (with composite)
         // cv::imshow("camera", camera);
@@ -1309,7 +1079,7 @@ int main(int argc, char** argv) {
                 auto it = std::find(avail.begin(), avail.end(), camIndex);
                 if (it == avail.end() || ++it == avail.end()) it = avail.begin();
                 int next = *it;
-                if (openCapture(cap, next, 1280, 720, 30)) {
+                if (openCapture(cap, next, 1280, 720, 60)) {
                     camIndex = next;
                 #ifdef __linux__
                     std::cerr << "Switched to [" << camIndex << "] " << v4l2NameFor(camIndex) << "\n";
@@ -1326,7 +1096,7 @@ int main(int argc, char** argv) {
                 if (it == avail.begin() || it == avail.end()) it = avail.end();
                 --it;
                 int prev = *it;
-                if (openCapture(cap, prev, 1280, 720, 30)) {
+                if (openCapture(cap, prev, 1280, 720, 60)) {
                     camIndex = prev;
                 #ifdef __linux__
                     std::cerr << "Switched to [" << camIndex << "] " << v4l2NameFor(camIndex) << "\n";
@@ -1338,7 +1108,7 @@ int main(int argc, char** argv) {
         }
         if (k >= '0' && k <= '9') {          // direct select 0..9
             int idx = k - '0';
-            if (openCapture(cap, idx, 1280, 720, 30)) {
+            if (openCapture(cap, idx, 1280, 720, 60)) {
                 camIndex = idx;
             #ifdef __linux__
                 std::cerr << "Switched to [" << camIndex << "] " << v4l2NameFor(camIndex) << "\n";
@@ -1424,7 +1194,7 @@ int main(int argc, char** argv) {
             break;
         }
 
-        g_clk.end_and_log();
+        clk.end();
     }
 
     save_controls();
@@ -1441,8 +1211,11 @@ int main(int argc, char** argv) {
     if (hudTex)     glDeleteTextures(1,&hudTex);
     if (hudFBO)     glDeleteFramebuffers(1,&hudFBO);
 
+    g_detRun.store(false, std::memory_order_release);
+    if (detThread.joinable()) detThread.join();
+
+
     hud.shutdown();
     glfwDestroyWindow(win); glfwTerminate();
-    sensor->stop();
     return 0;
 }

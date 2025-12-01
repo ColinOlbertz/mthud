@@ -136,8 +136,6 @@ void ArucoTracking::update(const cv::Mat& frame_bgr_or_gray) {
 
     ids_.clear(); corners_.clear(); rejected_.clear();
 
-    // Old API overload: pass Dictionary by value, params_ via Ptr
-    // Build a Ptr<Dictionary> from the value dict_ to satisfy this OpenCV ABI
     cv::Ptr<cv::aruco::Dictionary> dictPtr = cv::makePtr<cv::aruco::Dictionary>();
     *dictPtr = dict_;  // copy fields
 

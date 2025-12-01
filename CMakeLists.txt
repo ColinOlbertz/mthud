@@ -105,22 +105,33 @@ if(USE_XSENS)
     find_library(XSTYPES_LIB NAMES xstypes
       HINTS "${XSENS_SDK_ROOT}/lib" "/usr/local/xsens/mt-sdk/lib")
 
-    # Make runtime find the shared libs
-    set_target_properties(mthud PROPERTIES
-      BUILD_RPATH   "${XSENS_SDK_ROOT}/lib;$ORIGIN"
-      INSTALL_RPATH "${XSENS_SDK_ROOT}/lib;$ORIGIN")
+    get_filename_component(XSENS_LIB_DIR "${XSENS_LIB}" DIRECTORY)
+    get_filename_component(XSENS_XST_DIR "${XSTYPES_LIB}" DIRECTORY)
 
-    # Also drop the .so files next to the exe for convenience
-    add_custom_command(TARGET mthud POST_BUILD
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different
-              "${XSENS_SDK_ROOT}/lib/libxsensdeviceapi.so" "$<TARGET_FILE_DIR:mthud>/"
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different
-              "${XSENS_SDK_ROOT}/lib/libxstypes.so" "$<TARGET_FILE_DIR:mthud>/")
+    # Make runtime find the shared libs (prefer local copies next to the exe)
+    set_target_properties(mthud PROPERTIES
+      BUILD_RPATH   "$ORIGIN;${XSENS_LIB_DIR};${XSENS_XST_DIR}"
+      INSTALL_RPATH "$ORIGIN;${XSENS_LIB_DIR};${XSENS_XST_DIR}")
+
+    # Also drop the .so files (all versions/symlinks) next to the exe for convenience
+    file(GLOB XSENS_COPY_LIBS
+      "${XSENS_LIB_DIR}/libxsensdeviceapi.so*"
+      "${XSENS_XST_DIR}/libxstypes.so*")
+    list(REMOVE_DUPLICATES XSENS_COPY_LIBS)
+    foreach(lib ${XSENS_COPY_LIBS})
+      add_custom_command(TARGET mthud POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${lib}" "$<TARGET_FILE_DIR:mthud>/")
+    endforeach()
   endif()
 
   if(NOT XSENS_INCLUDE_DIR OR NOT XSENS_LIB OR NOT XSTYPES_LIB)
     message(FATAL_ERROR "Xsens SDK not found. Set XSENS_SDK_ROOT to your mt-sdk root (with include/ and lib/).")
   endif()
+
+  # Log what we actually found to catch stale installs after system updates
+  message(STATUS "Xsens SDK include: ${XSENS_INCLUDE_DIR}")
+  message(STATUS "Xsens SDK libs   : ${XSENS_LIB} ; ${XSTYPES_LIB}")
 
   target_include_directories(mthud PRIVATE "${XSENS_INCLUDE_DIR}")
   target_link_libraries(mthud PRIVATE "${XSENS_LIB}" "${XSTYPES_LIB}")
@@ -139,4 +150,3 @@ endforeach()
 
 # ---- Install (optional) ----------------------------------------------------
 install(TARGETS mthud RUNTIME DESTINATION bin)
-
