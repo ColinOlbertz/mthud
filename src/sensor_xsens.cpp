@@ -1,7 +1,12 @@
 #include "sensor.hpp"
+#include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
+#include <filesystem>
 #include <iostream>
+#include <string>
+#include <vector>
 
 // ---------------- DemoSensor ----------------
 void DemoSensor::start() {
@@ -25,7 +30,29 @@ void DemoSensor::start() {
 void DemoSensor::stop() { run = false; if (th.joinable()) th.join(); }
 
 #if USE_XSENS
+#if defined(XSENS_USE_STATIC)
+#include <xscontroller/xscontrol_def.h>
+#include <xscontroller/xsdevice_def.h>
+#include <xscontroller/xsscanner.h>
+#include <xscommon/journaller.h>
+#include <xstypes/xsbaud.h>
+#include <xstypes/xsbaudrate.h>
+#include <xstypes/xsdatapacket.h>
+#include <xstypes/xseuler.h>
+#include <xstypes/xsoutputconfigurationarray.h>
+#include <xstypes/xsportinfoarray.h>
+#include <xstypes/xsdeviceid.h>
+#include <xstypes/xspressure.h>
+#else
 #include <xsensdeviceapi.h>
+#include <xstypes/xsbaud.h>
+#include <xstypes/xsbaudrate.h>
+#endif
+
+#if defined(XSENS_USE_STATIC)
+// Required by Xsens journaller macros used inside xspublic
+Journaller* gJournal = nullptr;
+#endif
 
 // Keep Xsens types private to this TU
 class MyXsCallback : public XsCallback {
@@ -135,18 +162,58 @@ private:
         control = XsControl::construct();
         if (!control) { std::cerr << "XsControl::construct failed\n"; return; }
 
-        // Find an MTi/MTi-G
-        XsPortInfoArray ports = XsScanner::scanPorts();
+        // Build port/baud selection close to the official example
         XsPortInfo chosen;
-        for (const auto& p : ports) {
-            if (p.deviceId().isMti() || p.deviceId().isMtig()) { chosen = p; break; }
-        }
-        if (!chosen.deviceId().isValid()) { std::cerr << "No MTi device found\n"; return; }
+        XsBaudRate chosenBaud = XBR_Invalid;
 
-        if (!control->openPort(chosen.portName().toStdString(), chosen.baudrate())) {
-            std::cerr << "Failed to open " << chosen.portName().toStdString() << "\n"; return;
+        // Env override: XSENS_PORT + optional XSENS_BAUD
+        if (const char* envPort = std::getenv("XSENS_PORT")) {
+            if (*envPort) {
+                std::string portStr(envPort);
+                if (const char* envBaud = std::getenv("XSENS_BAUD")) {
+                    long b = std::strtol(envBaud, nullptr, 10);
+                    if (b > 0) chosenBaud = XsBaud::numericToRate(int(b));
+                }
+                chosen.setPortName(XsString(portStr.c_str()));
+                chosen.setBaudrate(chosenBaud);
+                std::cerr << "XSENS_PORT override: " << portStr;
+                if (chosenBaud != XBR_Invalid) std::cerr << " baud " << XsBaud::rateToNumeric(chosenBaud);
+                std::cerr << "\n";
+            }
         }
+
+        // If no override, use scanner result (first MTi)
+        if (chosen.portName().empty()) {
+            XsPortInfoArray ports = XsScanner::scanPorts();
+            std::cerr << "Xsens scan found " << ports.size() << " ports\n";
+            for (const auto& p : ports) {
+                std::cerr << "  " << p.portName().toStdString()
+                          << " id=" << p.deviceId().toString().toStdString()
+                          << " baud=" << (int)p.baudrate()
+                          << (p.deviceId().isMti() || p.deviceId().isMtig() ? " [MTi]" : "")
+                          << "\n";
+                if (chosen.portName().empty() && (p.deviceId().isMti() || p.deviceId().isMtig())) {
+                    chosen = p;
+                }
+            }
+        }
+
+        if (chosen.portName().empty()) { std::cerr << "No MTi device found\n"; return; }
+        if (chosenBaud == XBR_Invalid) {
+            chosenBaud = chosen.baudrate();
+            if (chosenBaud == XBR_Invalid) chosenBaud = XBR_115k2; // fallback
+        }
+
+        std::string portStr = chosen.portName().toStdString();
+        std::cerr << "Opening " << portStr << " at " << XsBaud::rateToNumeric(chosenBaud) << "\n";
+        if (!control->openPort(portStr, chosenBaud)) {
+            std::cerr << "openPort failed: " << control->lastResultText().toStdString()
+                      << " (" << (int)control->lastResult() << ")\n";
+            return;
+        }
+
         device = control->device(chosen.deviceId());
+        if (!device) { device = control->device(XsDeviceId()); }
         if (!device) { std::cerr << "Failed to get device handle\n"; return; }
 
         if (!device->gotoConfig()) { std::cerr << "gotoConfig failed\n"; return; }

@@ -74,56 +74,90 @@ endif()
 if(USE_XSENS)
   target_compile_definitions(mthud PRIVATE USE_XSENS=1)
 
+  option(XSENS_USE_STATIC "Use locally built static Xsens libs (xspublic)" OFF)
+
   # Resolve SDK root from cache var or env
   if(NOT XSENS_SDK_ROOT AND DEFINED ENV{XSENS_SDK_ROOT})
     set(XSENS_SDK_ROOT "$ENV{XSENS_SDK_ROOT}")
   endif()
   set(XSENS_SDK_ROOT "${XSENS_SDK_ROOT}" CACHE PATH "Path to Xsens MT SDK root (contains include/ and lib/)")
 
+  # Headers
   if(WIN32)
-    # Headers
     find_path(XSENS_INCLUDE_DIR xsensdeviceapi.h
       HINTS "${XSENS_SDK_ROOT}/include"
-            "$ENV{ProgramFiles}/Xsens/MT SDK/include"
-            "$ENV{ProgramFiles(x86)}/Xsens/MT SDK/include")
-
-    # Libs (names vary by SDK version)
-    find_library(XSENS_LIB   NAMES xsensdeviceapi xsensdeviceapi64
-      HINTS "${XSENS_SDK_ROOT}/lib"
-            "$ENV{ProgramFiles}/Xsens/MT SDK/lib"
-            "$ENV{ProgramFiles(x86)}/Xsens/MT SDK/lib")
-    find_library(XSTYPES_LIB NAMES xstypes xstypes64
-      HINTS "${XSENS_SDK_ROOT}/lib"
-            "$ENV{ProgramFiles}/Xsens/MT SDK/lib"
-            "$ENV{ProgramFiles(x86)}/Xsens/MT SDK/lib")
+            "$ENV{ProgramFiles}/Xsens/MT SDK/include")
   else()
-    # Linux default locations
     find_path(XSENS_INCLUDE_DIR xsensdeviceapi.h
       HINTS "${XSENS_SDK_ROOT}/include" "/usr/local/xsens/mt-sdk/include")
-    find_library(XSENS_LIB   NAMES xsensdeviceapi
-      HINTS "${XSENS_SDK_ROOT}/lib" "/usr/local/xsens/mt-sdk/lib")
-    find_library(XSTYPES_LIB NAMES xstypes
-      HINTS "${XSENS_SDK_ROOT}/lib" "/usr/local/xsens/mt-sdk/lib")
-
-    # Make runtime find the shared libs
-    set_target_properties(mthud PROPERTIES
-      BUILD_RPATH   "${XSENS_SDK_ROOT}/lib;$ORIGIN"
-      INSTALL_RPATH "${XSENS_SDK_ROOT}/lib;$ORIGIN")
-
-    # Also drop the .so files next to the exe for convenience
-    add_custom_command(TARGET mthud POST_BUILD
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different
-              "${XSENS_SDK_ROOT}/lib/libxsensdeviceapi.so" "$<TARGET_FILE_DIR:mthud>/"
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different
-              "${XSENS_SDK_ROOT}/lib/libxstypes.so" "$<TARGET_FILE_DIR:mthud>/")
   endif()
 
-  if(NOT XSENS_INCLUDE_DIR OR NOT XSENS_LIB OR NOT XSTYPES_LIB)
-    message(FATAL_ERROR "Xsens SDK not found. Set XSENS_SDK_ROOT to your mt-sdk root (with include/ and lib/).")
-  endif()
+  if(XSENS_USE_STATIC)
+    if(NOT XSENS_STATIC_ROOT AND DEFINED ENV{XSENS_STATIC_ROOT})
+      set(XSENS_STATIC_ROOT "$ENV{XSENS_STATIC_ROOT}")
+    endif()
+    set(XSENS_STATIC_ROOT "${XSENS_STATIC_ROOT}" CACHE PATH "Root to xspublic (containing xscontroller/xscommon/xstypes) if using static libs")
 
-  target_include_directories(mthud PRIVATE "${XSENS_INCLUDE_DIR}")
-  target_link_libraries(mthud PRIVATE "${XSENS_LIB}" "${XSTYPES_LIB}")
+    set(_xsroot "${XSENS_STATIC_ROOT}")
+    if(NOT _xsroot)
+      set(_xsroot "/tmp/xsens-example/xda_public_cpp/xspublic")
+    endif()
+
+    set(_XS_CTRL "${_xsroot}/xscontroller/libxscontroller.a")
+    set(_XS_COMM "${_xsroot}/xscommon/libxscommon.a")
+    set(_XS_TYPE "${_xsroot}/xstypes/libxstypes.a")
+
+    if(NOT EXISTS "${_XS_CTRL}" OR NOT EXISTS "${_XS_COMM}" OR NOT EXISTS "${_XS_TYPE}")
+      message(FATAL_ERROR "XSENS_USE_STATIC=ON but static libs not found under ${_xsroot}")
+    endif()
+
+    message(STATUS "Using Xsens static libs from ${_xsroot}")
+    target_compile_definitions(mthud PRIVATE XSENS_USE_STATIC=1)
+    target_include_directories(mthud PRIVATE
+      "${XSENS_INCLUDE_DIR}"
+      "${_xsroot}" "${_xsroot}/xscontroller" "${_xsroot}/xscommon" "${_xsroot}/xstypes")
+
+    target_link_libraries(mthud PRIVATE
+      "${_XS_CTRL}" "${_XS_COMM}" "${_XS_TYPE}"
+      pthread rt dl)
+  else()
+    if(WIN32)
+      # Libs (names vary by SDK version)
+      find_library(XSENS_LIB   NAMES xsensdeviceapi xsensdeviceapi64
+        HINTS "${XSENS_SDK_ROOT}/lib"
+              "$ENV{ProgramFiles}/Xsens/MT SDK/lib"
+              "$ENV{ProgramFiles(x86)}/Xsens/MT SDK/lib")
+      find_library(XSTYPES_LIB NAMES xstypes xstypes64
+        HINTS "${XSENS_SDK_ROOT}/lib"
+              "$ENV{ProgramFiles}/Xsens/MT SDK/lib"
+              "$ENV{ProgramFiles(x86)}/Xsens/MT SDK/lib")
+    else()
+      # Linux default locations
+      find_library(XSENS_LIB   NAMES xsensdeviceapi
+        HINTS "${XSENS_SDK_ROOT}/lib" "/usr/local/xsens/mt-sdk/lib")
+      find_library(XSTYPES_LIB NAMES xstypes
+        HINTS "${XSENS_SDK_ROOT}/lib" "/usr/local/xsens/mt-sdk/lib")
+
+      # Make runtime find the shared libs
+      set_target_properties(mthud PROPERTIES
+        BUILD_RPATH   "${XSENS_SDK_ROOT}/lib;$ORIGIN"
+        INSTALL_RPATH "${XSENS_SDK_ROOT}/lib;$ORIGIN")
+
+      # Also drop the .so files next to the exe for convenience
+      add_custom_command(TARGET mthud POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${XSENS_SDK_ROOT}/lib/libxsensdeviceapi.so" "$<TARGET_FILE_DIR:mthud>/"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${XSENS_SDK_ROOT}/lib/libxstypes.so" "$<TARGET_FILE_DIR:mthud>/")
+    endif()
+
+    if(NOT XSENS_INCLUDE_DIR OR NOT XSENS_LIB OR NOT XSTYPES_LIB)
+      message(FATAL_ERROR "Xsens SDK not found. Set XSENS_SDK_ROOT to your mt-sdk root (with include/ and lib/).")
+    endif()
+
+    target_include_directories(mthud PRIVATE "${XSENS_INCLUDE_DIR}")
+    target_link_libraries(mthud PRIVATE "${XSENS_LIB}" "${XSTYPES_LIB}")
+  endif()
 else()
   target_compile_definitions(mthud PRIVATE USE_XSENS=0)
 endif()
@@ -139,4 +173,3 @@ endforeach()
 
 # ---- Install (optional) ----------------------------------------------------
 install(TARGETS mthud RUNTIME DESTINATION bin)
-
