@@ -4,11 +4,13 @@
   "bank_radius_px": 310,
   "bank_top_px": 60,
   "bank_trim_deg": 0,
+  "gog_off_x_px": 1110,
+  "gog_off_y_px": 1200,
   "gog_show_axes": 1,
   "gog_show_markers": 1,
   "ladder_half_px": 360,
   "ladder_xoff_px": 0,
-  "ov_off_x_px": 0,
+  "ov_off_x_px": 1000,
   "ov_off_y_px": 1100,
   "ov_pitch_deg": 180,
   "ov_pivot_tl": 0,
@@ -21,5 +23,5 @@
   "text_flip_x": 0,
   "text_flip_y": 1,
   "text_scale_pct": 170,
-  "view_hfov_deg": 25
+  "view_hfov_deg": 22
 }

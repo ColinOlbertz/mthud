@@ -614,6 +614,8 @@ static int  TB_view_hfov_deg       = 23;  // deg; 0 = use camera intrinsics
 // ---- Goggles overlay controls (2D SRT applied after HUD warping) ----
 static int TB_gog_show_markers = 1;   // 0/1: draw detected markers in goggles
 static int TB_gog_show_axes    = 1;   // 0/1: draw axes in goggles
+static int TB_gog_off_x_px     = 1000; // image-space offset for goggles overlay (centered)
+static int TB_gog_off_y_px     = 1000;
 
 // Offsets in pixels mapped from 0..2000 => -1000..+1000
 static int TB_ov_off_x_px = 1000;     // centered() => -1000..+1000
@@ -646,6 +648,8 @@ static void save_controls() {
         {"view_hfov_deg",    TB_view_hfov_deg},
         {"gog_show_markers", TB_gog_show_markers},
         {"gog_show_axes",    TB_gog_show_axes},
+        {"gog_off_x_px",     TB_gog_off_x_px},
+        {"gog_off_y_px",     TB_gog_off_y_px},
         {"ov_off_x_px",    TB_ov_off_x_px},
         {"ov_off_y_px",    TB_ov_off_y_px},
         {"ov_scale_pct",    TB_ov_scale_pct},
@@ -678,6 +682,8 @@ static void load_controls() {
     get("view_hfov_deg",      TB_view_hfov_deg);
     get("gog_show_markers",    TB_gog_show_markers);
     get("gog_show_axes",       TB_gog_show_axes);
+    get("gog_off_x_px",        TB_gog_off_x_px);
+    get("gog_off_y_px",        TB_gog_off_y_px);
     get("ov_off_x_px",    TB_ov_off_x_px);
     get("ov_off_y_px",    TB_ov_off_y_px);
     get("ov_scale_pct",    TB_ov_scale_pct);
@@ -737,6 +743,8 @@ static void createControlsGroup2(int canvasH)
 
     tb("ShowMarkers",     &TB_gog_show_markers, 1);
     tb("ShowAxes",        &TB_gog_show_axes, 1);
+    tb("Gog_OffX",        &TB_gog_off_x_px, 2000);
+    tb("Gog_OffY",        &TB_gog_off_y_px, 2000);
 
     tb("OV_Scale_pct",    &TB_ov_scale_pct, 400);
     tb("OV_OffX",         &TB_ov_off_x_px, 2000);
@@ -1272,6 +1280,21 @@ int main(int argc, char** argv) {
             pushLine(gogAxisX, axis_ip_view[0], axis_ip_view[1]); // X
             pushLine(gogAxisY, axis_ip_view[0], axis_ip_view[2]); // Y
             pushLine(gogAxisZ, axis_ip_view[0], axis_ip_view[3]); // Z
+        }
+        // Apply manual eye-offset compensation for goggles overlay (image space)
+        if (!gogMarkerLines.empty() || !gogAxisX.empty() || !gogAxisY.empty() || !gogAxisZ.empty()) {
+            const float dx = float(centered(TB_gog_off_x_px, 2000));
+            const float dy = float(centered(TB_gog_off_y_px, 2000));
+            auto applyOffset = [&](std::vector<float>& v) {
+                for (size_t i = 0; i + 1 < v.size(); i += 2) {
+                    v[i]     += dx;
+                    v[i + 1] += dy;
+                }
+            };
+            applyOffset(gogMarkerLines);
+            applyOffset(gogAxisX);
+            applyOffset(gogAxisY);
+            applyOffset(gogAxisZ);
         }
 
         // --- Sensor → derived readouts
