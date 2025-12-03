@@ -108,11 +108,23 @@ if(USE_XSENS)
     set(_XS_TYPE "${_xsroot}/xstypes/libxstypes.a")
 
     if(NOT EXISTS "${_XS_CTRL}" OR NOT EXISTS "${_XS_COMM}" OR NOT EXISTS "${_XS_TYPE}")
-      message(FATAL_ERROR "XSENS_USE_STATIC=ON but static libs not found under ${_xsroot}")
+      # Build static libs from vendored xspublic if they are missing
+      find_program(MAKE_EXECUTABLE make)
+    if(NOT MAKE_EXECUTABLE)
+      message(FATAL_ERROR "XSENS_USE_STATIC=ON but static libs not found and 'make' is unavailable to build them under ${_xsroot}")
+    endif()
+    add_custom_target(xsens_static_libs ALL
+      COMMAND ${MAKE_EXECUTABLE} -C "${_xsroot}"
+        BYPRODUCTS "${_XS_CTRL}" "${_XS_COMM}" "${_XS_TYPE}"
+        WORKING_DIRECTORY "${_xsroot}"
+        COMMENT "Building Xsens static libraries from ${_xsroot}")
     endif()
 
     message(STATUS "Using Xsens static libs from ${_xsroot}")
     target_compile_definitions(mthud PRIVATE XSENS_USE_STATIC=1)
+    if(NOT XSENS_INCLUDE_DIR)
+      set(XSENS_INCLUDE_DIR "${_xsroot}")
+    endif()
     target_include_directories(mthud PRIVATE
       "${XSENS_INCLUDE_DIR}"
       "${_xsroot}" "${_xsroot}/xscontroller" "${_xsroot}/xscommon" "${_xsroot}/xstypes")
@@ -120,6 +132,9 @@ if(USE_XSENS)
     target_link_libraries(mthud PRIVATE
       "${_XS_CTRL}" "${_XS_COMM}" "${_XS_TYPE}"
       pthread rt dl)
+    if(TARGET xsens_static_libs)
+      add_dependencies(mthud xsens_static_libs)
+    endif()
   else()
     if(WIN32)
       # Libs (names vary by SDK version)

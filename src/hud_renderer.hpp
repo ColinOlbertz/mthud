@@ -2,6 +2,9 @@
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
 #include <string>
+#include <unordered_map>
+#include <list>
+#include <limits>
 
 struct HudState {
     // aircraft state
@@ -64,7 +67,15 @@ private:
     GLuint vaoTri_{ 0 }, vboTri_{ 0 };       // triangle list (x,y pairs)
 
     // text
-    GLuint vaoTxt_{ 0 }, vboTxt_{ 0 }, texTxt_{ 0 };
+    GLuint vaoTxt_{ 0 }, vboTxt_{ 0 };
+    struct TextCacheEntry {
+        GLuint tex{ 0 };
+        int width{ 0 };
+        int height{ 0 };
+        std::list<std::string>::iterator lruIt;
+    };
+    std::unordered_map<std::string, TextCacheEntry> textCache_;
+    std::list<std::string> textCacheLru_;
 
     // prebuilt arcs
     GLuint vaoTopArc_{ 0 }, vboTopArc_{ 0 };
@@ -73,6 +84,11 @@ private:
     // cached arc params
     float arcCenterY_px_{ 400.0f };
     float arcRadius_px_{ 300.0f };
+    float lastTopArcCenterY_{ std::numeric_limits<float>::quiet_NaN() };
+    float lastTopArcRadius_{ std::numeric_limits<float>::quiet_NaN() };
+    float lastCompCenterY_{ std::numeric_limits<float>::quiet_NaN() };
+    float lastCompRadius_{ std::numeric_limits<float>::quiet_NaN() };
+    int   lastCompCH_{ -1 };
 
     // helpers
     static GLuint compile(GLenum t, const char* s);
@@ -87,6 +103,9 @@ private:
     void setCommonUniforms_(int CW, int CH, float angle_rad, float Tx, float Ty, float Px, float Py);
     void setTextUniforms_(int CW, int CH, float angle_rad, float Tx, float Ty, float Px, float Py, float alpha);
 
+    const TextCacheEntry& getTextEntry_(const std::string& text);
+    void clearTextCache_();
+
     // draw a label whose quad is defined in canvas pixels, local origin at (x_px,y_px) relative to (centerX,centerY)
     void drawTextLabelPx_(const std::string& text,
         float x_px, float y_px, float h_px,
@@ -100,4 +119,5 @@ private:
         float angle_rad,
         float r, float g, float b, float alpha);
 
+    static constexpr size_t kMaxTextCache_ = 512;
 };

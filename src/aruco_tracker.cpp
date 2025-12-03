@@ -165,10 +165,16 @@ void ArucoTracking::update(const cv::Mat& frame_bgr_or_gray) {
     cv::Mat Rb; cv::Rodrigues(rvec_board, Rb);
     cv::Mat t_anchor = tvec_board + Rb * (cv::Mat_<double>(3, 1) << anchor_board.x, anchor_board.y, anchor_board.z);
 
-    if (!have_prev_) { prev_rvec_ = rvec_board.clone(); prev_tvec_ = t_anchor.clone(); have_prev_ = true; }
+    if (!have_prev_ || ema_alpha_ <= 0.0) {
+        // No smoothing requested: snap to current pose
+        prev_rvec_ = rvec_board.clone();
+        prev_tvec_ = t_anchor.clone();
+        have_prev_ = true;
+    }
     else {
         prev_rvec_ = rvecSlerp(prev_rvec_, rvec_board, ema_alpha_);
         prev_tvec_ = prev_tvec_ * (1.0 - ema_alpha_) + t_anchor * ema_alpha_;
+        have_prev_ = true;
     }
 
     last_.valid = true;

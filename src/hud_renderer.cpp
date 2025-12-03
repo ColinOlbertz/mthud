@@ -4,6 +4,7 @@
 #include <cmath>
 #include <iostream>
 #include <algorithm>
+#include <iterator>
 
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
@@ -122,10 +123,9 @@ bool HudRenderer::init() {
         glBufferData(GL_ARRAY_BUFFER, 16 * sizeof(float), nullptr, GL_DYNAMIC_DRAW);
         glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0); glEnableVertexAttribArray(0);
         glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float))); glEnableVertexAttribArray(1);
-        glGenTextures(1, &texTxt_);
-        glBindTexture(GL_TEXTURE_2D, texTxt_);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glUseProgram(progTxt_);
+        glUniform1i(glGetUniformLocation(progTxt_, "tex"), 0);
+        glUseProgram(0);
     }
 
     // arcs
@@ -135,19 +135,47 @@ bool HudRenderer::init() {
     return true;
 }
 
-void HudRenderer::shutdown() { /* optional */ }
+void HudRenderer::shutdown() {
+    clearTextCache_();
+
+    if (vboLines_) glDeleteBuffers(1, &vboLines_);
+    if (vaoLines_) glDeleteVertexArrays(1, &vaoLines_);
+    if (vboTri_) glDeleteBuffers(1, &vboTri_);
+    if (vaoTri_) glDeleteVertexArrays(1, &vaoTri_);
+    if (vboTxt_) glDeleteBuffers(1, &vboTxt_);
+    if (vaoTxt_) glDeleteVertexArrays(1, &vaoTxt_);
+    if (vboTopArc_) glDeleteBuffers(1, &vboTopArc_);
+    if (vaoTopArc_) glDeleteVertexArrays(1, &vaoTopArc_);
+    if (vboCompArc_) glDeleteBuffers(1, &vboCompArc_);
+    if (vaoCompArc_) glDeleteVertexArrays(1, &vaoCompArc_);
+    if (prog_) glDeleteProgram(prog_);
+    if (progTxt_) glDeleteProgram(progTxt_);
+
+    prog_ = progTxt_ = 0;
+    vaoLines_ = vaoTri_ = vaoTxt_ = vaoTopArc_ = vaoCompArc_ = 0;
+    vboLines_ = vboTri_ = vboTxt_ = vboTopArc_ = vboCompArc_ = 0;
+}
 
 void HudRenderer::setBankArcPx(float centerY_px, float radius_px) { arcCenterY_px_ = centerY_px; arcRadius_px_ = std::max(1.0f, radius_px); }
 
 void HudRenderer::ensureTopArc_(int CW, int CH) {
+    (void)CW; (void)CH;
+    if (arcCenterY_px_ == lastTopArcCenterY_ && arcRadius_px_ == lastTopArcRadius_) return;
+    lastTopArcCenterY_ = arcCenterY_px_;
+    lastTopArcRadius_ = arcRadius_px_;
     std::vector<float> v; v.reserve(2 * 121);
     for (int d = -60; d <= 60; ++d) { float a = d * PI / 180.f; float x = arcRadius_px_ * sinf(a); float y = arcRadius_px_ * cosf(a) + arcCenterY_px_; v.push_back(x); v.push_back(y); }
     glBindVertexArray(vaoTopArc_); glBindBuffer(GL_ARRAY_BUFFER, vboTopArc_);
     glBufferData(GL_ARRAY_BUFFER, v.size() * sizeof(float), v.data(), GL_DYNAMIC_DRAW);
 }
 void HudRenderer::ensureCompassArc_(int CW, int CH) {
+    (void)CW;
     float compCenterY_px = -0.90f * (CH * 0.5f);
     float compR_px = 0.85f * arcRadius_px_;
+    if (lastCompCH_ == CH && compCenterY_px == lastCompCenterY_ && compR_px == lastCompRadius_) return;
+    lastCompCH_ = CH;
+    lastCompCenterY_ = compCenterY_px;
+    lastCompRadius_ = compR_px;
     std::vector<float> v; v.reserve(2 * 360);
     for (int d = -180; d < 180; ++d) { float a = d * PI / 180.f; float x = compR_px * sinf(a); float y = compR_px * cosf(a) + compCenterY_px; v.push_back(x); v.push_back(y); }
     glBindVertexArray(vaoCompArc_); glBindBuffer(GL_ARRAY_BUFFER, vboCompArc_);
@@ -175,6 +203,60 @@ void HudRenderer::setTextUniforms_(int CW, int CH, float angle, float Tx, float 
     glUniform1f(uTxtAlpha_, alpha);
 }
 
+const HudRenderer::TextCacheEntry& HudRenderer::getTextEntry_(const std::string& text) {
+    auto it = textCache_.find(text);
+    if (it != textCache_.end()) {
+        // refresh LRU
+        textCacheLru_.splice(textCacheLru_.end(), textCacheLru_, it->second.lruIt);
+        return it->second;
+    }
+
+    // Rasterize once for this label
+    int baseline = 0; const double fontScale = 1.0; const int thickness = 2; const int Htex = 64; // raster height
+    cv::Size sz = cv::getTextSize(text, cv::FONT_HERSHEY_SIMPLEX, fontScale, thickness, &baseline);
+    int Wpx = std::max(8, sz.width + 8), Hpx = Htex + 8;
+    cv::Mat rgba(Hpx, Wpx, CV_8UC4, cv::Scalar(0, 0, 0, 0));
+    cv::putText(rgba, text, { 4, Htex }, cv::FONT_HERSHEY_SIMPLEX, fontScale, cv::Scalar(0, 255, 0, 255), thickness, cv::LINE_AA);
+
+    TextCacheEntry entry;
+    entry.width = rgba.cols;
+    entry.height = rgba.rows;
+
+    glGenTextures(1, &entry.tex);
+    glBindTexture(GL_TEXTURE_2D, entry.tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, rgba.cols, rgba.rows, 0, GL_BGRA, GL_UNSIGNED_BYTE, rgba.data);
+
+    textCacheLru_.push_back(text);
+    entry.lruIt = std::prev(textCacheLru_.end());
+    auto [insIt, _] = textCache_.emplace(text, std::move(entry));
+
+    // LRU eviction to keep memory bounded
+    if (textCache_.size() > kMaxTextCache_) {
+        const std::string victim = textCacheLru_.front();
+        textCacheLru_.pop_front();
+        auto vit = textCache_.find(victim);
+        if (vit != textCache_.end()) {
+            if (vit->second.tex) glDeleteTextures(1, &vit->second.tex);
+            textCache_.erase(vit);
+        }
+    }
+
+    return insIt->second;
+}
+
+void HudRenderer::clearTextCache_() {
+    for (auto& kv : textCache_) {
+        if (kv.second.tex) glDeleteTextures(1, &kv.second.tex);
+    }
+    textCache_.clear();
+    textCacheLru_.clear();
+}
+
 void HudRenderer::drawTextLabelPx_(const std::string& text,
     float x_px, float y_px, float h_px,
     float ang, float centerX, float centerY,
@@ -183,19 +265,11 @@ void HudRenderer::drawTextLabelPx_(const std::string& text,
     float flipX, float flipY) {
     if (text.empty() || h_px <= 0) return;
 
-    // rasterize label
-    int baseline = 0; const double fontScale = 1.0; const int thickness = 2; const int Htex = 64; // raster height
-    cv::Size sz = cv::getTextSize(text, cv::FONT_HERSHEY_SIMPLEX, fontScale, thickness, &baseline);
-    int Wpx = std::max(8, sz.width + 8), Hpx = Htex + 8;
-    cv::Mat rgba(Hpx, Wpx, CV_8UC4, cv::Scalar(0, 0, 0, 0));
-    cv::putText(rgba, text, { 4, Htex }, cv::FONT_HERSHEY_SIMPLEX, fontScale, cv::Scalar(0, 255, 0, 255), thickness, cv::LINE_AA);
-
-    glBindTexture(GL_TEXTURE_2D, texTxt_);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, rgba.cols, rgba.rows, 0, GL_BGRA, GL_UNSIGNED_BYTE, rgba.data);
+    const TextCacheEntry& tex = getTextEntry_(text);
+    if (tex.tex == 0 || tex.height <= 0) return;
 
     // scale bitmap to requested height in canvas px
-    float w_px = h_px * float(rgba.cols) / float(rgba.rows);
+    float w_px = h_px * float(tex.width) / float(tex.height);
     float x0 = x_px, y0 = y_px;                // local quad origin relative to (centerX,centerY)
     float x1 = x_px + w_px, y1 = y_px + h_px;
 
@@ -205,7 +279,7 @@ void HudRenderer::drawTextLabelPx_(const std::string& text,
 
     setTextUniforms_(CW, CH, ang, centerX, centerY, pivotX, pivotY, alpha);
     glUniform2f(uTxtFlip_, flipX, flipY);
-    glBindTexture(GL_TEXTURE_2D, texTxt_);
+    glBindTexture(GL_TEXTURE_2D, tex.tex);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 }
 
@@ -304,7 +378,8 @@ void HudRenderer::draw(const HudState& s) {
             // labels at ends, upright
             const float hLabel = 32.0f * std::max(0.2f, s.text_scale);
             const float margin = 16.0f;
-            std::string txt = (deg < 0 ? "-" : "") + std::to_string(std::abs(deg));
+            std::string txt = std::to_string(std::abs(deg));
+            if (deg < 0) txt.insert(txt.begin(), '-');
             // right label
             drawTextLabelPx_(txt, +useHalf + margin, -hLabel * 0.5f, hLabel, roll,
                 -T_rung.first, T_rung.second, 0.0f, 0.0f, CW, CH, 0.95f, float(s.flip_text_x), float(s.flip_text_y));
@@ -472,7 +547,6 @@ void HudRenderer::draw(const HudState& s) {
         {
             int hdg = 360 - (int)std::lround(wrap360(s.hdg_deg));
             char hbuf[16];
-            int v = std::clamp(hdg, -999, 999);
             std::snprintf(hbuf, sizeof(hbuf), "%03d", hdg);
 
             float h = 36.f * std::max(0.2f, s.text_scale);  // text height in px
@@ -617,7 +691,7 @@ void HudRenderer::draw(const HudState& s) {
             // --- Altitude source tag under the value window ---
             {
                 // Match the constants used inside drawTape’s window
-                const float boxW = 128.f, boxH = 48.f;
+                const float boxW = 128.f;
                 const float margin = 10.f;
 
                 // Window center for the right tape when labelsOnRight == false

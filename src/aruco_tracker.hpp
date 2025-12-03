@@ -24,6 +24,7 @@ public:
     void setAnchorMarkerCorner(int marker_id, int corner_idx);
 
     void setLockId(int marker_id);
+    // alpha in [0..1]; 0 = no smoothing (use measurement), 1 = fully smoothed
     void setTemporalSmoothing(double alpha, double gate_unused = 0.0);
 
     void update(const cv::Mat& frame_bgr_or_gray);
@@ -59,7 +60,7 @@ private:
     // Locking and smoothing
     int lock_id_ = -1;
     bool have_prev_ = false;
-    double ema_alpha_ = 0.;
+    double ema_alpha_ = 0.95;
     cv::Mat prev_rvec_, prev_tvec_;
 
     BoardPose last_;

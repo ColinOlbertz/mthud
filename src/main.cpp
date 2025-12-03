@@ -501,6 +501,73 @@ struct OverlayTexQuad {
     }
 };
 
+// Simple 2D line renderer in image pixel space (for marker overlays)
+struct LineOverlay {
+    GLuint prog = 0, vao = 0, vbo = 0;
+    GLint  uImgSize = -1, uColor = -1;
+    GLFWwindow* vaoCtx = nullptr; // VAOs are not shared across contexts
+
+    bool init() {
+        const char* vs = R"(#version 330 core
+            layout(location=0) in vec2 aPos; // image pixels (origin top-left)
+            uniform vec2 uImgSize;
+            void main(){
+                vec2 uv = aPos / uImgSize;
+                float x = uv.x * 2.0 - 1.0;
+                float y = (1.0 - uv.y) * 2.0 - 1.0; // flip Y to GL NDC
+                gl_Position = vec4(x, y, 0.0, 1.0);
+            })";
+        const char* fs = R"(#version 330 core
+            out vec4 FragColor;
+            uniform vec4 uColor;
+            void main(){ FragColor = uColor; })";
+
+        GLuint v = compileShader(GL_VERTEX_SHADER, vs);
+        GLuint f = compileShader(GL_FRAGMENT_SHADER, fs);
+        prog = (v && f) ? linkProgram(v, f) : 0;
+        if (!prog) return false;
+
+        uImgSize = glGetUniformLocation(prog, "uImgSize");
+        uColor   = glGetUniformLocation(prog, "uColor");
+
+        glGenBuffers(1, &vbo);
+        vaoCtx = nullptr; // force creation in first draw per-context
+        return true;
+    }
+
+    void draw(const std::vector<float>& xy, int imgW, int imgH, float r, float g, float b, float a, float lineWidth = 2.0f) {
+        if (xy.empty() || !prog) return;
+
+        // Recreate VAO when context changes (VAOs are not shared)
+        GLFWwindow* curCtx = glfwGetCurrentContext();
+        if (!vao || vaoCtx != curCtx) {
+            if (vao) glDeleteVertexArrays(1, &vao);
+            glGenVertexArrays(1, &vao);
+            vaoCtx = curCtx;
+        }
+
+        glUseProgram(prog);
+        glUniform2f(uImgSize, float(imgW), float(imgH));
+        glUniform4f(uColor, r, g, b, a);
+        glBindVertexArray(vao);
+        glBindBuffer(GL_ARRAY_BUFFER, vbo);
+        glBufferData(GL_ARRAY_BUFFER, xy.size() * sizeof(float), xy.data(), GL_STREAM_DRAW);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void*)0);
+        glLineWidth(lineWidth);
+        glDrawArrays(GL_LINES, 0, (GLsizei)(xy.size() / 2));
+        glBindVertexArray(0);
+        glUseProgram(0);
+    }
+
+    void shutdown() {
+        if (vbo) glDeleteBuffers(1, &vbo);
+        if (vao) glDeleteVertexArrays(1, &vao);
+        if (prog) glDeleteProgram(prog);
+        vbo = vao = prog = 0;
+    }
+};
+
 
 struct Viewport { int x, y, w, h; };
 static Viewport letterbox(int fbw, int fbh, int srcw, int srch) {
@@ -541,6 +608,9 @@ static int  TB_auto_pitch_from_cam = 1;   // 0/1
 static int  TB_auto_center_y_px    = -1;  // -1=mid
 static int  TB_probe_dY_canvas     = 100; // px
 
+// Display / view calibration
+static int  TB_view_hfov_deg       = 23;  // deg; 0 = use camera intrinsics
+
 // ---- Goggles overlay controls (2D SRT applied after HUD warping) ----
 static int TB_gog_show_markers = 1;   // 0/1: draw detected markers in goggles
 static int TB_gog_show_axes    = 1;   // 0/1: draw axes in goggles
@@ -573,6 +643,7 @@ static void save_controls() {
         {"auto_pitch_from_cam", TB_auto_pitch_from_cam},
         {"auto_center_y_px", TB_auto_center_y_px},
         {"probe_dY_canvas",  TB_probe_dY_canvas},
+        {"view_hfov_deg",    TB_view_hfov_deg},
         {"gog_show_markers", TB_gog_show_markers},
         {"gog_show_axes",    TB_gog_show_axes},
         {"ov_off_x_px",    TB_ov_off_x_px},
@@ -604,6 +675,7 @@ static void load_controls() {
     get("auto_pitch_from_cam", TB_auto_pitch_from_cam);
     get("auto_center_y_px",    TB_auto_center_y_px);
     get("probe_dY_canvas",     TB_probe_dY_canvas);
+    get("view_hfov_deg",      TB_view_hfov_deg);
     get("gog_show_markers",    TB_gog_show_markers);
     get("gog_show_axes",       TB_gog_show_axes);
     get("ov_off_x_px",    TB_ov_off_x_px);
@@ -614,6 +686,11 @@ static void load_controls() {
     get("ov_yaw_deg",    TB_ov_yaw_deg);
     get("ov_pivot_tl",    TB_ov_pivot_tl);
         
+    if (const char* e = std::getenv("VIEW_HFOV_DEG")) {
+        int v = std::atoi(e);
+        if (v >= 0 && v <= 170) TB_view_hfov_deg = v;
+    }
+
     if (j.contains("pitch_ndc_x1000") && !j.contains("pitch_trim_x1000"))
         TB_pitch_trim_x1000 = j["pitch_ndc_x1000"].get<int>();
 }
@@ -656,6 +733,7 @@ static void createControlsGroup2(int canvasH)
     tb("AutoPitch",       &TB_auto_pitch_from_cam, 1);
     tb("AutoCenterY_px",  &TB_auto_center_y_px, canvasH);
     tb("AutoProbe_dY",    &TB_probe_dY_canvas, 400);
+    tb("ViewHFOV_deg",    &TB_view_hfov_deg, 160);
 
     tb("ShowMarkers",     &TB_gog_show_markers, 1);
     tb("ShowAxes",        &TB_gog_show_axes, 1);
@@ -820,19 +898,44 @@ int main(int argc, char** argv) {
     // --- Camera
     int camIndex = parseCamIndex(argc, argv, /*fallback*/0);
 
+    auto envInt = [](const char* k, int def)->int {
+        if (const char* e = std::getenv(k)) {
+            int v = std::atoi(e);
+            if (v > 0) return v;
+        }
+        return def;
+    };
+    auto envDouble = [](const char* k, double def)->double {
+        if (const char* e = std::getenv(k)) {
+            double v = std::atof(e);
+            if (v > 0.0) return v;
+        }
+        return def;
+    };
+
+    int camW = 1280, camH = 720;
+    double camFPS = 30.0;
+    if (const char* res = std::getenv("CAM_RES")) {
+        int w = 0, h = 0;
+        if (std::sscanf(res, "%dx%d", &w, &h) == 2 && w > 0 && h > 0) { camW = w; camH = h; }
+    }
+    camW  = envInt("CAM_WIDTH",  camW);
+    camH  = envInt("CAM_HEIGHT", camH);
+    camFPS= envDouble("CAM_FPS", camFPS);
+
     cv::setUseOptimized(true);
     cv::setNumThreads(6);      // often best for ArUco; test 2..6
 
 
     cv::VideoCapture cap;
-    if (!openCapture(cap, camIndex, 1280, 720, 30)) {
+    if (!openCapture(cap, camIndex, camW, camH, camFPS)) {
         auto avail = scanCameras(12);
         if (avail.empty()) {
             std::cerr << "No camera could be opened.\n";
             return 1;
         }
         camIndex = avail.front();
-        if (!openCapture(cap, camIndex, 1280, 720, 30)) {
+        if (!openCapture(cap, camIndex, camW, camH, camFPS)) {
             std::cerr << "Failed to open first available camera.\n";
             return 1;
         }
@@ -858,19 +961,33 @@ int main(int argc, char** argv) {
     std::thread uiThread(uiThreadFunc, imgSize);
 
     // --- Calibration
-    cv::Mat K, D;
-    if (!loadCalibrationJSON("calibration.json", K, D, imgSize)) {
-        approxFOVIntrinsics(imgSize, 70.0, K, D);
-        std::cout << "No calibration.json. Using FOV approximation.\n";
+    cv::Mat K_cam, D_cam;
+    double cam_fallback_hfov_deg = 70.0;
+    if (const char* e = std::getenv("CAM_HFOV_DEG")) {
+        double v = std::atof(e);
+        if (v > 0.0 && v < 180.0) cam_fallback_hfov_deg = v;
+    }
+    if (!loadCalibrationJSON("calibration.json", K_cam, D_cam, imgSize)) {
+        approxFOVIntrinsics(imgSize, cam_fallback_hfov_deg, K_cam, D_cam);
+        std::cout << "No calibration.json. Using FOV approximation (" << cam_fallback_hfov_deg << " deg hfov).\n";
     }
     // Ensure 64F
-    K.convertTo(K, CV_64F); D.convertTo(D, CV_64F);
+    K_cam.convertTo(K_cam, CV_64F); D_cam.convertTo(D_cam, CV_64F);
+
+    // Separate intrinsics for how the HUD is rendered in the glasses.
+    cv::Mat K_view = K_cam.clone(), D_view = D_cam.clone();
+    auto refreshViewIntrinsics = [&](int hfov_deg) {
+        if (hfov_deg > 0) approxFOVIntrinsics(imgSize, double(hfov_deg), K_view, D_view);
+        else { K_view = K_cam.clone(); D_view = D_cam.clone(); }
+    };
+    refreshViewIntrinsics(TB_view_hfov_deg);
+    int prev_view_hfov_deg = TB_view_hfov_deg;
 
     // --- ArUco tracker
     ArucoTracking tracker;
     const int MX = 3, MY = 2;
     const float MARKER_LEN = 0.050f, GAP = 0.012f;
-    tracker.setCameraIntrinsics(K, D);
+    tracker.setCameraIntrinsics(K_cam, D_cam);
     tracker.setGridBoard(MX, MY, MARKER_LEN, GAP);
     tracker.setAnchorMarkerCorner(0, 0);
     //tracker.setTemporalSmoothing(0.5);
@@ -910,6 +1027,11 @@ int main(int argc, char** argv) {
     // GPU warp & composite programs
     GpuWarp warp;
     if (!warp.init()) std::cerr << "GpuWarp init failed\n";
+
+    LineOverlay lineOverlay;
+    if (!lineOverlay.init()) {
+        std::cerr << "Line overlay init failed\n";
+    }
 
     // --- Renderer
     HudRenderer hud; if (!hud.init()) { std::cerr << "hud.init failed\n"; return 1; }
@@ -992,6 +1114,12 @@ int main(int argc, char** argv) {
 
         g_clk.stamp_det_done();
 
+        // Live-adjust view intrinsics if the HFOV slider changed
+        if (TB_view_hfov_deg != prev_view_hfov_deg) {
+            prev_view_hfov_deg = TB_view_hfov_deg;
+            refreshViewIntrinsics(prev_view_hfov_deg);
+        }
+
         BoardPose pose = tracker.latest();
 
         // --- Compute homography early (so scale applies to BOTH camera and goggles)
@@ -1045,8 +1173,8 @@ int main(int argc, char** argv) {
                 }
             }
 
-            // Project the (optionally rotated) HUD rectangle into the camera
-            cv::projectPoints(bb_obj, pose.rvec, pose.tvec, K, D, bb_img);
+            // Project the (optionally rotated) HUD rectangle using the view intrinsics
+            cv::projectPoints(bb_obj, pose.rvec, pose.tvec, K_view, D_view, bb_img);
 
             // src HUD quad (FBO) → dst image quad (TR,TL,BL,BR → TL,TR,BR,BL)
             std::vector<cv::Point2f> srcHUD = {
@@ -1091,15 +1219,59 @@ int main(int argc, char** argv) {
         cv::Mat camera = frame; // reuse captured buffer to avoid an extra clone
         if (!tracker.ids().empty())
             cv::aruco::drawDetectedMarkers(camera, tracker.corners(), tracker.ids());
+
+        std::vector<cv::Point2f> axis_ip_cam, axis_ip_view;
         if (pose.valid) {
             float A = MARKER_LEN * 0.7f;
             std::vector<cv::Point3f> axisPts = { {0,0,0},{A,0,0},{0,A,0},{0,0,A} };
-            std::vector<cv::Point2f> ip;
-            cv::projectPoints(axisPts, pose.rvec, pose.tvec, K, D, ip);
-            auto lineAA = [&](int a, int b, cv::Scalar c) { cv::line(camera, ip[a], ip[b], c, 2, cv::LINE_AA); };
+            cv::projectPoints(axisPts, pose.rvec, pose.tvec, K_cam, D_cam, axis_ip_cam);
+            cv::projectPoints(axisPts, pose.rvec, pose.tvec, K_view, D_view, axis_ip_view);
+            auto lineAA = [&](int a, int b, cv::Scalar c) { cv::line(camera, axis_ip_cam[a], axis_ip_cam[b], c, 2, cv::LINE_AA); };
             lineAA(0, 1, { 0,  0,255 }); // X red
             lineAA(0, 2, { 0,255,  0 }); // Y green
             lineAA(0, 3, { 255,  0,  0 }); // Z blue
+        }
+
+        // Pre-build ArUco overlays for the glasses (image space)
+        std::vector<float> gogMarkerLines, gogAxisX, gogAxisY, gogAxisZ;
+        if (TB_gog_show_markers && pose.valid) {
+            // Reproject marker corners using the board pose so they stay registered in the glasses
+            const float len = MARKER_LEN;
+            const float gap = GAP;
+            auto addMarker = [&](int id) {
+                if (id < 0 || id >= MX * MY) return;
+                int row = id / MX, col = id % MX;
+                float x0 = col * (len + gap);
+                float y0 = row * (len + gap);
+                std::vector<cv::Point3f> obj = {
+                    {x0,      y0,      0},
+                    {x0+len,  y0,      0},
+                    {x0+len,  y0+len,  0},
+                    {x0,      y0+len,  0}
+                };
+                std::vector<cv::Point2f> img;
+                cv::projectPoints(obj, pose.rvec, pose.tvec, K_view, D_view, img);
+                auto addEdge = [&](const cv::Point2f& a, const cv::Point2f& b) {
+                    gogMarkerLines.push_back(a.x); gogMarkerLines.push_back(a.y);
+                    gogMarkerLines.push_back(b.x); gogMarkerLines.push_back(b.y);
+                };
+                if (img.size() == 4) {
+                    addEdge(img[0], img[1]);
+                    addEdge(img[1], img[2]);
+                    addEdge(img[2], img[3]);
+                    addEdge(img[3], img[0]);
+                }
+            };
+            for (int id : tracker.ids()) addMarker(id);
+        }
+        if (TB_gog_show_axes && axis_ip_view.size() == 4) {
+            auto pushLine = [](std::vector<float>& v, const cv::Point2f& a, const cv::Point2f& b) {
+                v.push_back(a.x); v.push_back(a.y);
+                v.push_back(b.x); v.push_back(b.y);
+            };
+            pushLine(gogAxisX, axis_ip_view[0], axis_ip_view[1]); // X
+            pushLine(gogAxisY, axis_ip_view[0], axis_ip_view[2]); // Y
+            pushLine(gogAxisZ, axis_ip_view[0], axis_ip_view[3]); // Z
         }
 
         // --- Sensor → derived readouts
@@ -1182,7 +1354,7 @@ int main(int argc, char** argv) {
                            ? float(CANVAS_H * 0.5f)
                            : float(TB_auto_center_y_px);
             float px_per_deg_canvas = 0.f;
-            if (canvasPxPerDegree_fromIntrinsics(Hh64, K, D,
+            if (canvasPxPerDegree_fromIntrinsics(Hh64, K_view, D_view,
                                                  cy, std::max(10, TB_probe_dY_canvas),
                                                  px_per_deg_canvas)) {
                 px_per_deg_canvas = std::clamp(px_per_deg_canvas, 10.0f, 4000.0f);
@@ -1248,7 +1420,7 @@ int main(int argc, char** argv) {
                 auto it = std::find(avail.begin(), avail.end(), camIndex);
                 if (it == avail.end() || ++it == avail.end()) it = avail.begin();
                 int next = *it;
-                if (openCapture(cap, next, 1280, 720, 30)) {
+                if (openCapture(cap, next, camW, camH, camFPS)) {
                     camIndex = next;
                 #ifdef __linux__
                     std::cerr << "Switched to [" << camIndex << "] " << v4l2NameFor(camIndex) << "\n";
@@ -1265,7 +1437,7 @@ int main(int argc, char** argv) {
                 if (it == avail.begin() || it == avail.end()) it = avail.end();
                 --it;
                 int prev = *it;
-                if (openCapture(cap, prev, 1280, 720, 30)) {
+                if (openCapture(cap, prev, camW, camH, camFPS)) {
                     camIndex = prev;
                 #ifdef __linux__
                     std::cerr << "Switched to [" << camIndex << "] " << v4l2NameFor(camIndex) << "\n";
@@ -1277,7 +1449,7 @@ int main(int argc, char** argv) {
         }
         if (k >= '0' && k <= '9') {          // direct select 0..9
             int idx = k - '0';
-            if (openCapture(cap, idx, 1280, 720, 30)) {
+            if (openCapture(cap, idx, camW, camH, camFPS)) {
                 camIndex = idx;
             #ifdef __linux__
                 std::cerr << "Switched to [" << camIndex << "] " << v4l2NameFor(camIndex) << "\n";
@@ -1310,6 +1482,9 @@ int main(int argc, char** argv) {
 
             glEnable(GL_BLEND);
             glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glDisable(GL_DEPTH_TEST);
+            glDisable(GL_CULL_FACE);
+            glDisable(GL_STENCIL_TEST);
 
             // If no pose this frame, show nothing (alpha=0). With a valid pose draw HUD at full alpha.
             if (haveH) {
@@ -1320,9 +1495,18 @@ int main(int argc, char** argv) {
                     /*hudW=*/HUD_TEX_W,      /*hudH=*/HUD_TEX_H,
                     /*alpha=*/1.0f
                 );
+            }
 
-            } else {
-                // Optional: leave cleared (transparent) when pose is invalid
+            // Optional ArUco overlays in the glasses (image space)
+            if (lineOverlay.prog) {
+                if (!gogMarkerLines.empty())
+                    lineOverlay.draw(gogMarkerLines, imgSize.width, imgSize.height, 0.1f, 1.0f, 0.1f, 0.9f, 2.0f);
+                if (!gogAxisX.empty())
+                    lineOverlay.draw(gogAxisX, imgSize.width, imgSize.height, 0.0f, 0.4f, 1.0f, 0.9f, 3.0f);
+                if (!gogAxisY.empty())
+                    lineOverlay.draw(gogAxisY, imgSize.width, imgSize.height, 0.0f, 1.0f, 0.0f, 0.9f, 3.0f);
+                if (!gogAxisZ.empty())
+                    lineOverlay.draw(gogAxisZ, imgSize.width, imgSize.height, 1.0f, 0.0f, 0.0f, 0.9f, 3.0f);
             }
 
             // Present the overlay
@@ -1385,6 +1569,7 @@ int main(int argc, char** argv) {
         glfwDestroyWindow(hudOverlay);
     }
     previewQuad.shutdown();
+    lineOverlay.shutdown();
     if (hudTex)     glDeleteTextures(1,&hudTex);
     if (hudFBO)     glDeleteFramebuffers(1,&hudFBO);
 

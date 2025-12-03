@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <cctype>
 #include <string>
 #include <vector>
 
@@ -39,6 +40,7 @@ void DemoSensor::stop() { run = false; if (th.joinable()) th.join(); }
 #include <xstypes/xsbaudrate.h>
 #include <xstypes/xsdatapacket.h>
 #include <xstypes/xseuler.h>
+#include <xstypes/xsfilterprofilearray.h>
 #include <xstypes/xsoutputconfigurationarray.h>
 #include <xstypes/xsportinfoarray.h>
 #include <xstypes/xsdeviceid.h>
@@ -47,12 +49,40 @@ void DemoSensor::stop() { run = false; if (th.joinable()) th.join(); }
 #include <xsensdeviceapi.h>
 #include <xstypes/xsbaud.h>
 #include <xstypes/xsbaudrate.h>
+#include <xstypes/xsfilterprofilearray.h>
 #endif
 
 #if defined(XSENS_USE_STATIC)
 // Required by Xsens journaller macros used inside xspublic
 Journaller* gJournal = nullptr;
 #endif
+
+static bool icontains(const std::string& hay, const std::string& needle) {
+    if (needle.empty()) return true;
+    return std::search(hay.begin(), hay.end(),
+                       needle.begin(), needle.end(),
+                       [](char a, char b) {
+                           return std::tolower(static_cast<unsigned char>(a)) ==
+                                  std::tolower(static_cast<unsigned char>(b));
+                       }) != hay.end();
+}
+
+static const XsFilterProfile* pickHeadingProfile(const XsFilterProfileArray& profiles) {
+    XsSize count = profiles.size();
+    if (count == 0) return nullptr;
+    const XsFilterProfile* fallback = &profiles[0];
+    for (const auto& p : profiles) {
+        std::string label = p.label() ? p.label() : "";
+        std::string kind  = p.kind() ? p.kind() : "";
+        if (p.type() == XFPK_Heading ||
+            icontains(kind, "heading") ||
+            icontains(label, "heading") ||
+            icontains(label, "north")) {
+            return &p;
+        }
+    }
+    return fallback;
+}
 
 // Keep Xsens types private to this TU
 class MyXsCallback : public XsCallback {
@@ -217,6 +247,38 @@ private:
         if (!device) { std::cerr << "Failed to get device handle\n"; return; }
 
         if (!device->gotoConfig()) { std::cerr << "gotoConfig failed\n"; return; }
+
+        auto setHeadingProfile = [&]() -> bool {
+            if (!device) return false;
+
+            if (const char* envProf = std::getenv("XSENS_FILTER_PROFILE")) {
+                if (*envProf) {
+                    XsString prof(envProf);
+                    if (device->setOnboardFilterProfile(prof)) {
+                        std::cerr << "Using XSENS_FILTER_PROFILE=" << envProf << "\n";
+                        return true;
+                    }
+                    std::cerr << "XSENS_FILTER_PROFILE=" << envProf << " not accepted, auto-selecting\n";
+                }
+            }
+
+            XsFilterProfileArray profiles = device->availableOnboardFilterProfiles();
+            const XsFilterProfile* hp = pickHeadingProfile(profiles);
+            if (!hp) {
+                std::cerr << "No filter profiles reported; keeping device default\n";
+                return false;
+            }
+
+            if (device->setOnboardFilterProfile(int(hp->type()))) {
+                std::cerr << "Selected filter profile: " << (hp->label() ? hp->label() : "(unnamed)")
+                          << " (type " << int(hp->type()) << ")\n";
+                return true;
+            }
+            std::cerr << "setOnboardFilterProfile failed for type " << int(hp->type()) << "\n";
+            return false;
+        };
+
+        setHeadingProfile();
 
         // === Output configuration (your SDK ids) ===
         XsOutputConfigurationArray cfgs;
