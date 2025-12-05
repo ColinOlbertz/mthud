@@ -4,11 +4,26 @@
   "dependencies": [
     {
       "name": "opencv4",
+      "platform": "linux",
       "default-features": false,
       "features": [
         "contrib",
         "highgui",
         "gtk",
+        "jpeg",
+        "png",
+        "tiff",
+        "webp",
+        "quirc"
+      ]
+    },
+    {
+      "name": "opencv4",
+      "platform": "!linux",
+      "default-features": false,
+      "features": [
+        "contrib",
+        "highgui",
         "jpeg",
         "png",
         "tiff",
@@ -25,4 +40,3 @@
     "spdlog"
   ]
 }
-

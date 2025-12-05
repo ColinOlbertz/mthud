@@ -1,6 +1,7 @@
 ﻿#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cctype>
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -39,9 +40,23 @@ static const float HINV_ID[9] = { 1,0,0,  0,1,0,  0,0,1 };
   #include <unistd.h>
 #endif
 
+static int backendFromEnv() {
+    if (const char* env = std::getenv("CAM_BACKEND")) {
+        std::string s(env);
+        std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c){ return std::tolower(c); });
+        if (s == "dshow") return cv::CAP_DSHOW;
+        if (s == "msmf")  return cv::CAP_MSMF;
+        if (s == "v4l2")  return cv::CAP_V4L2;
+        if (s == "any")   return cv::CAP_ANY;
+    }
+    return -1;
+}
+
 static int preferredBackend() {
+    int env = backendFromEnv();
+    if (env >= 0) return env;
 #if defined(_WIN32)
-    return cv::CAP_DSHOW;
+    return cv::CAP_DSHOW; // DirectShow tends to be most reliable; override with CAM_BACKEND if needed
 #elif defined(__linux__)
     return cv::CAP_V4L2;
 #else
@@ -66,24 +81,49 @@ static std::string v4l2NameFor(int idx) {
 
 static std::vector<int> scanCameras(int maxIdx = 12) {
     std::vector<int> ok;
+    const int primary = preferredBackend();
     for (int i = 0; i <= maxIdx; ++i) {
-        cv::VideoCapture t(i, preferredBackend());
-        if (t.isOpened()) ok.push_back(i);
+        cv::VideoCapture t;
+        if (t.open(i, primary) || (primary != cv::CAP_ANY && t.open(i, cv::CAP_ANY))) {
+            if (t.isOpened()) ok.push_back(i);
+        }
     }
     return ok;
+}
+
+static void lockCameraParams(cv::VideoCapture& cap) {
+    // Try to keep exposure / gain / WB from drifting frame-to-frame
+    cap.set(cv::CAP_PROP_AUTO_EXPOSURE, 0.25); // V4L2: 0.25 manual, 0.75 auto
+    double exp = cap.get(cv::CAP_PROP_EXPOSURE);
+    if (std::isfinite(exp)) cap.set(cv::CAP_PROP_EXPOSURE, exp);
+
+    cap.set(cv::CAP_PROP_AUTO_WB, 0.0);
+    double wb = cap.get(cv::CAP_PROP_WB_TEMPERATURE);
+    if (std::isfinite(wb) && wb > 0.0) cap.set(cv::CAP_PROP_WB_TEMPERATURE, wb);
+
+    double gain = cap.get(cv::CAP_PROP_GAIN);
+    if (std::isfinite(gain)) cap.set(cv::CAP_PROP_GAIN, gain);
 }
 
 static bool openCapture(cv::VideoCapture& cap, int index,
                         int w, int h, double fps) {
     cap.release();
-    if (!cap.open(index, preferredBackend())) return false;
-    if (w > 0) cap.set(cv::CAP_PROP_FRAME_WIDTH,  w);
-    if (h > 0) cap.set(cv::CAP_PROP_FRAME_HEIGHT, h);
-    if (fps > 0) cap.set(cv::CAP_PROP_FPS, fps);
-    cap.set(cv::CAP_PROP_BUFFERSIZE, 1);
-    cv::Mat probe;
-    if (!cap.read(probe) || probe.empty()) return false;
-    return true;
+    const int primary = preferredBackend();
+    const int backends[] = { primary, cv::CAP_ANY };
+
+    for (int backend : backends) {
+        if (backend == cv::CAP_ANY && primary == cv::CAP_ANY) continue; // avoid duplicate attempt
+        if (!cap.open(index, backend)) continue;
+        if (w > 0) cap.set(cv::CAP_PROP_FRAME_WIDTH,  w);
+        if (h > 0) cap.set(cv::CAP_PROP_FRAME_HEIGHT, h);
+        if (fps > 0) cap.set(cv::CAP_PROP_FPS, fps);
+        cap.set(cv::CAP_PROP_BUFFERSIZE, 1);
+        lockCameraParams(cap);
+        cv::Mat probe;
+        if (cap.read(probe) && !probe.empty()) return true;
+        cap.release();
+    }
+    return false;
 }
 
 static int parseCamIndex(int argc, char** argv, int fallback = 0) {
@@ -602,7 +642,7 @@ static int TB_ladder_xoff_px    = 0;    // px
 static int TB_text_scale_pct    = 120;  // %
 static int TB_text_flip_x       = 1;    // 0/1
 static int TB_text_flip_y       = 0;    // 0/1
-static int TB_aruco_smooth_pct  = 95;   // 0..100 => 0..1 EMA for ArUco pose
+static int TB_aruco_smooth_pct  = 50;   // 0..100 => 0..1 EMA for ArUco pose
 
 // Auto pitch scale from camera intrinsics+homography
 static int  TB_auto_pitch_from_cam = 1;   // 0/1

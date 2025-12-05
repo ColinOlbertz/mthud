@@ -81,6 +81,15 @@ ArucoTracking::ArucoTracking() {
 #ifdef cv_aruco_CornerRefineMethod
     params_->cornerRefinementMethod = cv::aruco::CORNER_REFINE_SUBPIX;
 #endif
+    params_->cornerRefinementWinSize = 5;
+    params_->cornerRefinementMaxIterations = 50;
+    params_->cornerRefinementMinAccuracy = 0.01;
+
+    // Tighten adaptive thresholding to avoid edge flicker between frames
+    params_->adaptiveThreshWinSizeMin = 3;
+    params_->adaptiveThreshWinSizeMax = 23;
+    params_->adaptiveThreshWinSizeStep = 4;
+    params_->adaptiveThreshConstant = 7;
 }
 
 void ArucoTracking::setCameraIntrinsics(const cv::Mat& K, const cv::Mat& D) {
@@ -142,6 +151,20 @@ void ArucoTracking::update(const cv::Mat& frame_bgr_or_gray) {
     *dictPtr = dict_;  // copy fields
 
     cv::aruco::detectMarkers(gray, dictPtr, corners_, ids_, params_, rejected_);
+
+    // Refine using board geometry; helps corner lock without slowing frame rate
+    if (board_) {
+        cv::aruco::refineDetectedMarkers(gray, board_, corners_, ids_, rejected_, K_, D_);
+    }
+
+    if (!ids_.empty()) {
+        // Extra sub-pixel polish to calm single-pixel jitter on edges
+        cv::TermCriteria tc(cv::TermCriteria::EPS + cv::TermCriteria::MAX_ITER, 30, 0.01);
+        for (auto& c : corners_) {
+            if (c.size() == 4)
+                cv::cornerSubPix(gray, c, cv::Size(5, 5), cv::Size(-1, -1), tc);
+        }
+    }
 
     if (ids_.empty() || !board_) return;
 

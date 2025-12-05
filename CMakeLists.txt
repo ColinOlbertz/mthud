@@ -8,7 +8,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # ---- Options ---------------------------------------------------------------
-option(USE_XSENS "Enable Xsens MT SDK integration" ON)
+option(USE_XSENS "Enable Xsens MT SDK integration" OFF)
 
 # ---- Dependencies via vcpkg / system --------------------------------------
 find_package(Threads REQUIRED)
@@ -29,11 +29,8 @@ set(MTHUD_SOURCES
   src/aruco_tracker.cpp
   src/hud_renderer.cpp
   src/config.cpp
+  src/sensor_xsens.cpp
 )
-
-if(USE_XSENS)
-  list(APPEND MTHUD_SOURCES src/sensor_xsens.cpp)
-endif()
 
 add_executable(mthud ${MTHUD_SOURCES})
 
