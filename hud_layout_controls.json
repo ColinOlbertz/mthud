@@ -1,4 +1,5 @@
 {
+  "aruco_smooth_pct": 95,
   "auto_center_y_px": 0,
   "auto_pitch_from_cam": 1,
   "bank_radius_px": 310,
