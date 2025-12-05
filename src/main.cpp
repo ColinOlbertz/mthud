@@ -602,6 +602,7 @@ static int TB_ladder_xoff_px    = 0;    // px
 static int TB_text_scale_pct    = 120;  // %
 static int TB_text_flip_x       = 1;    // 0/1
 static int TB_text_flip_y       = 0;    // 0/1
+static int TB_aruco_smooth_pct  = 95;   // 0..100 => 0..1 EMA for ArUco pose
 
 // Auto pitch scale from camera intrinsics+homography
 static int  TB_auto_pitch_from_cam = 1;   // 0/1
@@ -642,6 +643,7 @@ static void save_controls() {
         {"text_scale_pct",   TB_text_scale_pct},
         {"text_flip_x",      TB_text_flip_x},
         {"text_flip_y",      TB_text_flip_y},
+        {"aruco_smooth_pct", TB_aruco_smooth_pct},
         {"auto_pitch_from_cam", TB_auto_pitch_from_cam},
         {"auto_center_y_px", TB_auto_center_y_px},
         {"probe_dY_canvas",  TB_probe_dY_canvas},
@@ -676,6 +678,7 @@ static void load_controls() {
     get("text_scale_pct",    TB_text_scale_pct);
     get("text_flip_x",       TB_text_flip_x);
     get("text_flip_y",       TB_text_flip_y);
+    get("aruco_smooth_pct",  TB_aruco_smooth_pct);
     get("auto_pitch_from_cam", TB_auto_pitch_from_cam);
     get("auto_center_y_px",    TB_auto_center_y_px);
     get("probe_dY_canvas",     TB_probe_dY_canvas);
@@ -743,6 +746,7 @@ static void createControlsGroup2(int canvasH)
 
     tb("ShowMarkers",     &TB_gog_show_markers, 1);
     tb("ShowAxes",        &TB_gog_show_axes, 1);
+    tb("ArucoSmooth_pct", &TB_aruco_smooth_pct, 100);
     tb("Gog_OffX",        &TB_gog_off_x_px, 2000);
     tb("Gog_OffY",        &TB_gog_off_y_px, 2000);
 
@@ -998,7 +1002,8 @@ int main(int argc, char** argv) {
     tracker.setCameraIntrinsics(K_cam, D_cam);
     tracker.setGridBoard(MX, MY, MARKER_LEN, GAP);
     tracker.setAnchorMarkerCorner(0, 0);
-    //tracker.setTemporalSmoothing(0.5);
+    int prev_aruco_smooth_pct = std::clamp(TB_aruco_smooth_pct, 0, 100);
+    tracker.setTemporalSmoothing(prev_aruco_smooth_pct / 100.0);
 
     // --- Sensor
     auto sensor = makeSensor(); sensor->start();
@@ -1117,6 +1122,12 @@ int main(int argc, char** argv) {
         }
 
         g_clk.stamp_cap_done();
+
+        int cur_smooth_pct = std::clamp(TB_aruco_smooth_pct, 0, 100);
+        if (cur_smooth_pct != prev_aruco_smooth_pct) {
+            prev_aruco_smooth_pct = cur_smooth_pct;
+            tracker.setTemporalSmoothing(prev_aruco_smooth_pct / 100.0);
+        }
 
         tracker.update(frame);
 
