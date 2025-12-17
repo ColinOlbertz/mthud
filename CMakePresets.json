@@ -1,0 +1,94 @@
+{
+  "version": 4,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 20,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "windows-msvc",
+      "displayName": "Windows MSVC (vcpkg)",
+      "description": "Visual Studio 2022 generator with vcpkg x64-windows triplet.",
+      "generator": "Visual Studio 17 2022",
+      "binaryDir": "${sourceDir}/build/windows-msvc",
+      "architecture": {
+        "value": "x64",
+        "strategy": "set"
+      },
+      "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+        "VCPKG_TARGET_TRIPLET": "x64-windows",
+        "USE_XSENS": "OFF"
+      }
+    },
+    {
+      "name": "windows-msvc-xsens",
+      "displayName": "Windows MSVC (vcpkg + Xsens)",
+      "description": "Visual Studio 2022 generator with vcpkg x64-windows triplet and Xsens enabled.",
+      "inherits": "windows-msvc",
+      "cacheVariables": {
+        "USE_XSENS": "ON",
+        "XSENS_SDK_ROOT": "${sourceDir}/third_party/xsens"
+      }
+    },
+    {
+      "name": "linux-ninja-base",
+      "displayName": "Linux Ninja base (vcpkg)",
+      "description": "Base Ninja preset for Linux with vcpkg x64-linux triplet.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+        "VCPKG_TARGET_TRIPLET": "x64-linux",
+        "USE_XSENS": "ON"
+      }
+    },
+    {
+      "name": "linux-ninja-release",
+      "inherits": ["linux-ninja-base"],
+      "displayName": "Linux Ninja Release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "linux-ninja-debug",
+      "inherits": ["linux-ninja-base"],
+      "displayName": "Linux Ninja Debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "windows-msvc-release",
+      "configurePreset": "windows-msvc",
+      "configuration": "Release"
+    },
+    {
+      "name": "windows-msvc-debug",
+      "configurePreset": "windows-msvc",
+      "configuration": "Debug"
+    },
+    {
+      "name": "windows-msvc-xsens-release",
+      "configurePreset": "windows-msvc-xsens",
+      "configuration": "Release"
+    },
+    {
+      "name": "windows-msvc-xsens-debug",
+      "configurePreset": "windows-msvc-xsens",
+      "configuration": "Debug"
+    },
+    {
+      "name": "linux-ninja-release",
+      "configurePreset": "linux-ninja-release"
+    },
+    {
+      "name": "linux-ninja-debug",
+      "configurePreset": "linux-ninja-debug"
+    }
+  ]
+}

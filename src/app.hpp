@@ -57,7 +57,8 @@ inline void buildSRT_px(float SRT[9],
   const double dx = centered(off_x_px,2000);
   const double dy = centered(off_y_px,2000);
   const double s  = std::max(0.01, scale_pct/100.0);
-  const double r  = centered(rot_deg,360) * (M_PI/180.0);
+  constexpr double kPi = 3.14159265358979323846;
+  const double r  = centered(rot_deg,360) * (kPi/180.0);
   const double cx = (pivot_tl? 0.0 : 0.5*hudW);
   const double cy = (pivot_tl? 0.0 : 0.5*hudH);
   const double c = std::cos(r), sn = std::sin(r);

@@ -4,6 +4,7 @@
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <sstream>
 #include <vector>
 #include <cmath>
 #include <optional>
@@ -74,17 +75,64 @@ static std::string v4l2NameFor(int idx) {
 
 static std::vector<int> scanCameras(int maxIdx = 12) {
     std::vector<int> ok;
+    // Try common Windows backends (DSHOW/MSMF) and a generic fallback; Linux already prefers V4L2.
+    std::vector<int> backends{
+#if defined(_WIN32)
+        cv::CAP_DSHOW, cv::CAP_MSMF, cv::CAP_ANY
+#elif defined(__linux__)
+        cv::CAP_V4L2, cv::CAP_ANY
+#else
+        cv::CAP_ANY
+#endif
+    };
+
     for (int i = 0; i <= maxIdx; ++i) {
-        cv::VideoCapture t(i, preferredBackend());
-        if (t.isOpened()) ok.push_back(i);
+        for (int b : backends) {
+            cv::VideoCapture t(i, b);
+            if (t.isOpened()) { ok.push_back(i); break; }
+        }
     }
     return ok;
+}
+
+static std::vector<std::string> defaultCamNames() {
+    std::vector<std::string> names;
+    if (const char* env = std::getenv("CAM_NAME")) {
+        std::stringstream ss(env);
+        std::string item;
+        while (std::getline(ss, item, ',')) {
+            if (!item.empty()) names.push_back(item);
+        }
+    }
+
+    // Common Windows camera friendly names (add more if needed)
+    for (const char* n : {
+            "Integrated Camera",
+            "HD Camera",
+            "HD Webcam",
+            "USB Camera",
+            "Logitech HD Webcam",
+            "FaceTime HD Camera" }) {
+        names.emplace_back(n);
+    }
+    return names;
 }
 
 static bool openCapture(cv::VideoCapture& cap, int index,
                         int w, int h, double fps) {
     cap.release();
-    if (!cap.open(index, preferredBackend())) return false;
+    // Try multiple backends on Windows to cope with driver quirks.
+    const int backendList[] = {
+        preferredBackend(),
+#if defined(_WIN32)
+        cv::CAP_MSMF,
+#endif
+        cv::CAP_ANY
+    };
+    for (int b : backendList) {
+        if (cap.open(index, b)) break;
+    }
+    if (!cap.isOpened()) return false;
     if (w > 0) cap.set(cv::CAP_PROP_FRAME_WIDTH,  w);
     if (h > 0) cap.set(cv::CAP_PROP_FRAME_HEIGHT, h);
     if (fps > 0) cap.set(cv::CAP_PROP_FPS, fps);
@@ -551,17 +599,30 @@ int main(int argc, char** argv) {
     cv::setUseOpenVX(false);
     cv::setNumThreads(6);      // often best for ArUco; test 2..6
 
+    // Try by friendly name first (DSHOW/MSMF), then by index.
+    auto camNames = defaultCamNames();
 
     cv::VideoCapture cap;
-    if (!openCapture(cap, camIndex, 1280, 720, 60)) {
+    if (!openAnyCamera(cap, camIndex, camNames, 1280, 720)) {
         auto avail = scanCameras(12);
         if (avail.empty()) {
-            std::cerr << "No camera could be opened.\n";
+            std::cerr << "No camera could be opened (by name or index).\n";
             return 1;
         }
-        camIndex = avail.front();
-        if (!openCapture(cap, camIndex, 1280, 720, 60)) {
-            std::cerr << "Failed to open first available camera.\n";
+        bool opened = false;
+        for (int idx : avail) {
+            if (openAnyCamera(cap, idx, camNames, 1280, 720)) {
+                camIndex = idx;
+                opened = true;
+                break;
+            }
+        }
+        if (!opened) {
+            std::cerr << "Failed to open any available camera (tried ";
+            for (size_t i = 0; i < avail.size(); ++i) {
+                std::cerr << (i ? ", " : "") << avail[i];
+            }
+            std::cerr << "). If you know the exact device name, set CAM_NAME=\"Your Camera Name\".\n";
             return 1;
         }
     }

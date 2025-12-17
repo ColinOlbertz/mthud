@@ -4,17 +4,16 @@
   "dependencies": [
     {
       "name": "opencv4",
+      "default-features": true,
+      "features": [ "contrib", "ffmpeg" ]
+    },
+    {
+      "name": "opencv4",
       "default-features": false,
       "features": [
-        "contrib",
-        "highgui",
-        "gtk",
-        "jpeg",
-        "png",
-        "tiff",
-        "webp",
-        "quirc"
-      ]
+        "gtk"
+      ],
+      "platform": "!windows"
     },
     "glfw3",
     "glad",
@@ -25,4 +24,3 @@
     "spdlog"
   ]
 }
-

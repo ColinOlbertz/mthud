@@ -1,5 +1,17 @@
 cmake_minimum_required(VERSION 3.20)
 
+# Default vcpkg toolchain/triplet per host OS if the user didn't set them.
+if(NOT DEFINED CMAKE_TOOLCHAIN_FILE AND DEFINED ENV{VCPKG_ROOT})
+  set(CMAKE_TOOLCHAIN_FILE "$ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake" CACHE PATH "vcpkg toolchain file")
+endif()
+if(NOT DEFINED VCPKG_TARGET_TRIPLET)
+  if(WIN32)
+    set(VCPKG_TARGET_TRIPLET "x64-windows" CACHE STRING "vcpkg triplet")
+  elseif(UNIX)
+    set(VCPKG_TARGET_TRIPLET "x64-linux" CACHE STRING "vcpkg triplet")
+  endif()
+endif()
+
 project(mthud LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -29,11 +41,8 @@ set(MTHUD_SOURCES
   src/aruco_tracker.cpp
   src/hud_renderer.cpp
   src/config.cpp
+  src/sensor_xsens.cpp
 )
-
-if(USE_XSENS)
-  list(APPEND MTHUD_SOURCES src/sensor_xsens.cpp)
-endif()
 
 add_executable(mthud ${MTHUD_SOURCES})
 
@@ -78,24 +87,24 @@ if(USE_XSENS)
   if(NOT XSENS_SDK_ROOT AND DEFINED ENV{XSENS_SDK_ROOT})
     set(XSENS_SDK_ROOT "$ENV{XSENS_SDK_ROOT}")
   endif()
+  if(NOT XSENS_SDK_ROOT)
+    set(XSENS_SDK_ROOT "${CMAKE_SOURCE_DIR}/third_party/xsens")
+  endif()
   set(XSENS_SDK_ROOT "${XSENS_SDK_ROOT}" CACHE PATH "Path to Xsens MT SDK root (contains include/ and lib/)")
 
   if(WIN32)
     # Headers
     find_path(XSENS_INCLUDE_DIR xsensdeviceapi.h
       HINTS "${XSENS_SDK_ROOT}/include"
-            "$ENV{ProgramFiles}/Xsens/MT SDK/include"
-            "$ENV{ProgramFiles(x86)}/Xsens/MT SDK/include")
+            "$ENV{ProgramFiles}/Xsens/MT SDK/include")
 
     # Libs (names vary by SDK version)
     find_library(XSENS_LIB   NAMES xsensdeviceapi xsensdeviceapi64
       HINTS "${XSENS_SDK_ROOT}/lib"
-            "$ENV{ProgramFiles}/Xsens/MT SDK/lib"
-            "$ENV{ProgramFiles(x86)}/Xsens/MT SDK/lib")
+            "$ENV{ProgramFiles}/Xsens/MT SDK/lib")
     find_library(XSTYPES_LIB NAMES xstypes xstypes64
       HINTS "${XSENS_SDK_ROOT}/lib"
-            "$ENV{ProgramFiles}/Xsens/MT SDK/lib"
-            "$ENV{ProgramFiles(x86)}/Xsens/MT SDK/lib")
+            "$ENV{ProgramFiles}/Xsens/MT SDK/lib")
   else()
     # Linux default locations
     find_path(XSENS_INCLUDE_DIR xsensdeviceapi.h
@@ -135,6 +144,17 @@ if(USE_XSENS)
 
   target_include_directories(mthud PRIVATE "${XSENS_INCLUDE_DIR}")
   target_link_libraries(mthud PRIVATE "${XSENS_LIB}" "${XSTYPES_LIB}")
+
+  if(WIN32)
+    # Copy any DLLs next to the exe so deployment is self-contained
+    get_filename_component(XSENS_LIB_DIR "${XSENS_LIB}" DIRECTORY)
+    file(GLOB XSENS_DLLS "${XSENS_LIB_DIR}/*.dll")
+    if(XSENS_DLLS)
+      add_custom_command(TARGET mthud POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${XSENS_DLLS} "$<TARGET_FILE_DIR:mthud>/")
+    endif()
+  endif()
 else()
   target_compile_definitions(mthud PRIVATE USE_XSENS=0)
 endif()
