@@ -9,6 +9,7 @@
 #include <cmath>
 #include <optional>
 #include <chrono>
+#include <filesystem>
 
 #include <thread>
 #include <mutex>
@@ -32,6 +33,12 @@ static const float PI = 3.14159265358979323846f;
 
 static const float HINV_ID[9] = { 1,0,0,  0,1,0,  0,0,1 };
 
+namespace fs = std::filesystem;
+static fs::path configPath(const char* filename) {
+    // Always resolve relative to the project root so configs live in mthud/
+    return fs::path(PROJECT_SOURCE_DIR) / filename;
+}
+
 //--------------------- linux vs windows cam setup --------------------------------
 #ifdef __linux__
   #include <fcntl.h>
@@ -40,9 +47,24 @@ static const float HINV_ID[9] = { 1,0,0,  0,1,0,  0,0,1 };
   #include <unistd.h>
 #endif
 
+static std::optional<std::string> getEnvString(const char* key) {
+#ifdef _WIN32
+    size_t len = 0;
+    char* buf = nullptr;
+    if (_dupenv_s(&buf, &len, key) != 0 || !buf) return std::nullopt;
+    std::string val(buf, len ? len - 1 : 0);
+    std::free(buf);
+    return val;
+#else
+    const char* v = std::getenv(key);
+    if (!v) return std::nullopt;
+    return std::string(v);
+#endif
+}
+
 static int backendFromEnv() {
-    if (const char* env = std::getenv("CAM_BACKEND")) {
-        std::string s(env);
+    if (auto env = getEnvString("CAM_BACKEND")) {
+        std::string s(*env);
         std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c){ return std::tolower(c); });
         if (s == "dshow") return cv::CAP_DSHOW;
         if (s == "msmf")  return cv::CAP_MSMF;
@@ -127,7 +149,7 @@ static bool openCapture(cv::VideoCapture& cap, int index,
 }
 
 static int parseCamIndex(int argc, char** argv, int fallback = 0) {
-    if (const char* e = std::getenv("CAM_INDEX"); e && *e) return std::atoi(e);
+    if (auto e = getEnvString("CAM_INDEX"); e && !e->empty()) return std::atoi(e->c_str());
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if ((a == "-c" || a == "--cam") && i + 1 < argc) return std::atoi(argv[i + 1]);
@@ -629,7 +651,8 @@ static Viewport letterbox(int fbw, int fbh, int srcw, int srch) {
 
 // ---------- controls + persistence ----------
 //static const char* WIN_CTRL = "HUD Controls"; 
-static const char* PERSIST = "hud_layout_controls.json";
+static const fs::path BASE_DIR = fs::path(PROJECT_SOURCE_DIR);
+static const fs::path PERSIST = configPath("hud_layout_controls.json");
 
 // HUD placement controls
 static int TB_pitch_scale_x1000 = 20;   // manual NDC/deg *1000
@@ -705,7 +728,12 @@ static void save_controls() {
     std::ofstream(PERSIST) << j.dump(2);
 }
 static void load_controls() {
-    std::ifstream f(PERSIST); if (!f) return;
+    if (!fs::exists(PERSIST)) {
+        std::cerr << "Controls file not found at " << PERSIST << " (using defaults)\n";
+        return;
+    }
+    std::ifstream f(PERSIST);
+    if (!f) { std::cerr << "Failed to open controls file: " << PERSIST << "\n"; return; }
     json j; f >> j;
     auto get = [&](const char* k, int& v) { if (j.contains(k)) v = j[k].get<int>(); };
     get("pitch_scale_x1000", TB_pitch_scale_x1000);
@@ -735,8 +763,8 @@ static void load_controls() {
     get("ov_yaw_deg",    TB_ov_yaw_deg);
     get("ov_pivot_tl",    TB_ov_pivot_tl);
         
-    if (const char* e = std::getenv("VIEW_HFOV_DEG")) {
-        int v = std::atoi(e);
+    if (auto e = getEnvString("VIEW_HFOV_DEG")) {
+        int v = std::atoi(e->c_str());
         if (v >= 0 && v <= 170) TB_view_hfov_deg = v;
     }
 
@@ -751,6 +779,7 @@ static void createControlsGroup1()
 {
     cv::namedWindow("HUD Controls 1", cv::WINDOW_NORMAL);
     cv::resizeWindow("HUD Controls 1", 420, 600);
+    cv::moveWindow("HUD Controls 1", 40, 40);
 
     auto tb = [&](const char* name, int* var, int maxv) {
         cv::createTrackbar(name, "HUD Controls 1", var, maxv, nullptr);
@@ -773,6 +802,7 @@ static void createControlsGroup2(int canvasH)
 {
     cv::namedWindow("HUD Controls 2", cv::WINDOW_NORMAL);
     cv::resizeWindow("HUD Controls 2", 420, 600);
+    cv::moveWindow("HUD Controls 2", 480, 40);
 
     auto tb = [&](const char* name, int* var, int maxv) {
         cv::createTrackbar(name, "HUD Controls 2", var, maxv, nullptr);
@@ -838,11 +868,45 @@ static void uiThreadFunc(cv::Size imgSize)
 
 static bool loadCalibrationJSON(const std::string& path, cv::Mat& K, cv::Mat& D, cv::Size& size) {
     try {
+        // First try plain JSON parse (works with simple arrays as in calibration.json)
+        std::ifstream jf(path);
+        if (jf) {
+            json j; jf >> j;
+            if (j.contains("camera_matrix")) {
+                auto v = j["camera_matrix"].get<std::vector<double>>();
+                if (v.size() == 9) K = cv::Mat(v, true).reshape(1, 3);
+            }
+            if (j.contains("distortion_coefficients")) {
+                auto v = j["distortion_coefficients"].get<std::vector<double>>();
+                if (!v.empty()) D = cv::Mat(v, true).reshape(1, 1);
+            }
+            if (j.contains("image_width") && j.contains("image_height")) {
+                int wj = j["image_width"].get<int>();
+                int hj = j["image_height"].get<int>();
+                if (wj > 0 && hj > 0) size = cv::Size(wj, hj);
+            }
+        }
+
+        // Fallback to OpenCV FileStorage for YAML/JSON matrices
         cv::FileStorage fs(path, cv::FileStorage::READ | cv::FileStorage::FORMAT_JSON);
-        if (!fs.isOpened()) return false;
-        fs["K"] >> K; fs["D"] >> D;
-        int w = 0, h = 0; fs["image_width"] >> w; fs["image_height"] >> h;
-        if (w > 0 && h > 0) size = cv::Size(w, h);
+        if (fs.isOpened()) {
+            fs["K"] >> K; fs["D"] >> D;
+            int w = 0, h = 0; fs["image_width"] >> w; fs["image_height"] >> h;
+            if (w > 0 && h > 0) size = cv::Size(w, h);
+            if (K.empty() || D.empty()) {
+                // Fallback to common OpenCV JSON/YAML keys
+                cv::Mat camMat, dist;
+                fs["camera_matrix"] >> camMat;
+                fs["distortion_coefficients"] >> dist;
+                if (!camMat.empty() && camMat.total() == 9) {
+                    camMat = camMat.reshape(1, 3);
+                    K = camMat.clone();
+                }
+                if (!dist.empty()) {
+                    D = dist.clone();
+                }
+            }
+        }
         if (K.empty() || D.empty()) return false;
         K.convertTo(K, CV_64F); D.convertTo(D, CV_64F);
         return true;
@@ -951,15 +1015,15 @@ int main(int argc, char** argv) {
     int camIndex = parseCamIndex(argc, argv, /*fallback*/0);
 
     auto envInt = [](const char* k, int def)->int {
-        if (const char* e = std::getenv(k)) {
-            int v = std::atoi(e);
+        if (auto e = getEnvString(k)) {
+            int v = std::atoi(e->c_str());
             if (v > 0) return v;
         }
         return def;
     };
     auto envDouble = [](const char* k, double def)->double {
-        if (const char* e = std::getenv(k)) {
-            double v = std::atof(e);
+        if (auto e = getEnvString(k)) {
+            double v = std::atof(e->c_str());
             if (v > 0.0) return v;
         }
         return def;
@@ -967,9 +1031,17 @@ int main(int argc, char** argv) {
 
     int camW = 1280, camH = 720;
     double camFPS = 30.0;
-    if (const char* res = std::getenv("CAM_RES")) {
-        int w = 0, h = 0;
-        if (std::sscanf(res, "%dx%d", &w, &h) == 2 && w > 0 && h > 0) { camW = w; camH = h; }
+    if (auto res = getEnvString("CAM_RES")) {
+        const auto xPos = res->find('x');
+        if (xPos != std::string::npos) {
+            try {
+                int w = std::stoi(res->substr(0, xPos));
+                int h = std::stoi(res->substr(xPos + 1));
+                if (w > 0 && h > 0) { camW = w; camH = h; }
+            } catch (const std::exception&) {
+                // ignore invalid override
+            }
+        }
     }
     camW  = envInt("CAM_WIDTH",  camW);
     camH  = envInt("CAM_HEIGHT", camH);
@@ -980,46 +1052,75 @@ int main(int argc, char** argv) {
 
 
     cv::VideoCapture cap;
-    if (!openCapture(cap, camIndex, camW, camH, camFPS)) {
+    bool cameraAvailable = openCapture(cap, camIndex, camW, camH, camFPS);
+    if (!cameraAvailable) {
         auto avail = scanCameras(12);
         if (avail.empty()) {
-            std::cerr << "No camera could be opened.\n";
-            return 1;
-        }
-        camIndex = avail.front();
-        if (!openCapture(cap, camIndex, camW, camH, camFPS)) {
-            std::cerr << "Failed to open first available camera.\n";
-            return 1;
+            std::cerr << "No camera could be opened. Continuing without video input.\n";
+        } else {
+            camIndex = avail.front();
+            cameraAvailable = openCapture(cap, camIndex, camW, camH, camFPS);
+            if (!cameraAvailable) {
+                std::cerr << "Failed to open first available camera; running HUD without camera.\n";
+            }
         }
     }
 
     #ifdef __linux__
-    std::cerr << "Active camera index: " << camIndex
-              << " name: " << v4l2NameFor(camIndex) << "\n";
+    if (cameraAvailable) {
+        std::cerr << "Active camera index: " << camIndex
+                  << " name: " << v4l2NameFor(camIndex) << "\n";
+    }
     #else
-    std::cerr << "Active camera index: " << camIndex << "\n";
+    if (cameraAvailable) {
+        std::cerr << "Active camera index: " << camIndex << "\n";
+    }
     #endif
 
     // Optional MJPG request
-    cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M','J','P','G'));
+    if (cameraAvailable) {
+        cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M','J','P','G'));
+    }
 
     cv::Mat frame;
-    if (!cap.grab() || !cap.retrieve(frame) || frame.empty()) {
-        std::cerr << "Initial frame empty\n";
-        return 1;
+    if (cameraAvailable) {
+        if (!cap.grab() || !cap.retrieve(frame) || frame.empty()) {
+            std::cerr << "Initial frame empty; switching to HUD-only mode.\n";
+            cameraAvailable = false;
+        }
+    }
+    if (!cameraAvailable) {
+        frame = cv::Mat::zeros(camH, camW, CV_8UC3);
     }
     cv::Size imgSize = frame.size();
     // --- Start UI thread (OpenCV camera + trackbars)
-    std::thread uiThread(uiThreadFunc, imgSize);
+    bool uiAvailable = true;
+    try {
+        cv::namedWindow("__hud_ui_probe__", cv::WINDOW_NORMAL);
+        cv::destroyWindow("__hud_ui_probe__");
+    } catch (const cv::Exception& e) {
+        uiAvailable = false;
+        std::cerr << "OpenCV UI backend not available; running headless. " << e.what() << "\n";
+    } catch (...) {
+        uiAvailable = false;
+        std::cerr << "OpenCV UI backend not available; running headless.\n";
+    }
+    std::thread uiThread;
+    if (uiAvailable) {
+        uiThread = std::thread(uiThreadFunc, imgSize);
+    } else {
+        load_controls(); // still apply persisted settings even without the UI
+    }
 
     // --- Calibration
     cv::Mat K_cam, D_cam;
     double cam_fallback_hfov_deg = 70.0;
-    if (const char* e = std::getenv("CAM_HFOV_DEG")) {
-        double v = std::atof(e);
+    if (auto e = getEnvString("CAM_HFOV_DEG")) {
+        double v = std::atof(e->c_str());
         if (v > 0.0 && v < 180.0) cam_fallback_hfov_deg = v;
     }
-    if (!loadCalibrationJSON("calibration.json", K_cam, D_cam, imgSize)) {
+    const std::string calibPath = configPath("calibration.json").string();
+    if (!loadCalibrationJSON(calibPath, K_cam, D_cam, imgSize)) {
         approxFOVIntrinsics(imgSize, cam_fallback_hfov_deg, K_cam, D_cam);
         std::cout << "No calibration.json. Using FOV approximation (" << cam_fallback_hfov_deg << " deg hfov).\n";
     }
@@ -1102,6 +1203,10 @@ int main(int argc, char** argv) {
     int currentOverlayIdx = -1;
     OverlayTexQuad ovQuad;
 
+    auto ensureFrameValid = [&](){
+        if (frame.empty()) frame = cv::Mat::zeros(imgSize.height, imgSize.width, CV_8UC3);
+    };
+
     auto recreateOverlayAt = [&](int idx) {
         if (hudOverlay) {
             glfwMakeContextCurrent(hudOverlay);
@@ -1152,13 +1257,18 @@ int main(int argc, char** argv) {
     while (g_running) {
         g_clk.begin();
 
-        if (!cap.grab()) {
-            std::cerr << "cap.grab() failed\n";
-            break;
-        }
-        if (!cap.retrieve(frame) || frame.empty()) {
-            std::cerr << "cap.retrieve() empty\n";
-            break;
+        if (cameraAvailable) {
+            if (!cap.grab()) {
+                std::cerr << "cap.grab() failed; switching to HUD-only mode.\n";
+                cameraAvailable = false;
+                ensureFrameValid();
+            } else if (!cap.retrieve(frame) || frame.empty()) {
+                std::cerr << "cap.retrieve() empty; switching to HUD-only mode.\n";
+                cameraAvailable = false;
+                ensureFrameValid();
+            }
+        } else {
+            ensureFrameValid();
         }
 
         g_clk.stamp_cap_done();
@@ -1429,7 +1539,7 @@ int main(int argc, char** argv) {
                            : float(TB_auto_center_y_px);
             float px_per_deg_canvas = 0.f;
             if (canvasPxPerDegree_fromIntrinsics(Hh64, K_view, D_view,
-                                                 cy, std::max(10, TB_probe_dY_canvas),
+                                                 cy, std::max<float>(10.f, float(TB_probe_dY_canvas)),
                                                  px_per_deg_canvas)) {
                 px_per_deg_canvas = std::clamp(px_per_deg_canvas, 10.0f, 4000.0f);
                 hs.pitch_px_per_deg = px_per_deg_canvas;
@@ -1468,70 +1578,72 @@ int main(int argc, char** argv) {
 
         // GPU composite window removed; camera preview stays in the OpenCV UI
 
-        // ---- Show camera preview (with composite)
-        // cv::imshow("camera", camera);
-        int k = cv::waitKey(1);
-        if (k == 27) break;
+        if (uiAvailable) {
+            // ---- Show camera preview (with composite)
+            // cv::imshow("camera", camera);
+            int k = cv::waitKey(1);
+            if (k == 27) break;
 
-        if (k == 'l') {                      // list cameras
-            auto avail = scanCameras(12);
-            std::cerr << "Cameras found:";
-            if (avail.empty()) std::cerr << " none\n";
-            else {
-                std::cerr << "\n";
-                for (int idx : avail) {
-                #ifdef __linux__
-                    std::cerr << "  [" << idx << "] " << v4l2NameFor(idx) << "\n";
-                #else
-                    std::cerr << "  [" << idx << "]\n";
-                #endif
+            if (k == 'l') {                      // list cameras
+                auto avail = scanCameras(12);
+                std::cerr << "Cameras found:";
+                if (avail.empty()) std::cerr << " none\n";
+                else {
+                    std::cerr << "\n";
+                    for (int idx : avail) {
+                    #ifdef __linux__
+                        std::cerr << "  [" << idx << "] " << v4l2NameFor(idx) << "\n";
+                    #else
+                        std::cerr << "  [" << idx << "]\n";
+                    #endif
+                    }
                 }
             }
-        }
-        if (k == 'n') {                      // next camera
-            auto avail = scanCameras(12);
-            if (!avail.empty()) {
-                auto it = std::find(avail.begin(), avail.end(), camIndex);
-                if (it == avail.end() || ++it == avail.end()) it = avail.begin();
-                int next = *it;
-                if (openCapture(cap, next, camW, camH, camFPS)) {
-                    camIndex = next;
+            if (k == 'n') {                      // next camera
+                auto avail = scanCameras(12);
+                if (!avail.empty()) {
+                    auto it = std::find(avail.begin(), avail.end(), camIndex);
+                    if (it == avail.end() || ++it == avail.end()) it = avail.begin();
+                    int next = *it;
+                    if (openCapture(cap, next, camW, camH, camFPS)) {
+                        camIndex = next;
+                    #ifdef __linux__
+                        std::cerr << "Switched to [" << camIndex << "] " << v4l2NameFor(camIndex) << "\n";
+                    #else
+                        std::cerr << "Switched to [" << camIndex << "]\n";
+                    #endif
+                    }
+                }
+            }
+            if (k == 'p') {                      // prev camera
+                auto avail = scanCameras(12);
+                if (!avail.empty()) {
+                    auto it = std::find(avail.begin(), avail.end(), camIndex);
+                    if (it == avail.begin() || it == avail.end()) it = avail.end();
+                    --it;
+                    int prev = *it;
+                    if (openCapture(cap, prev, camW, camH, camFPS)) {
+                        camIndex = prev;
+                    #ifdef __linux__
+                        std::cerr << "Switched to [" << camIndex << "] " << v4l2NameFor(camIndex) << "\n";
+                    #else
+                        std::cerr << "Switched to [" << camIndex << "]\n";
+                    #endif
+                    }
+                }
+            }
+            if (k >= '0' && k <= '9') {          // direct select 0..9
+                int idx = k - '0';
+                if (openCapture(cap, idx, camW, camH, camFPS)) {
+                    camIndex = idx;
                 #ifdef __linux__
                     std::cerr << "Switched to [" << camIndex << "] " << v4l2NameFor(camIndex) << "\n";
                 #else
                     std::cerr << "Switched to [" << camIndex << "]\n";
                 #endif
+                } else {
+                    std::cerr << "Failed to open camera " << idx << "\n";
                 }
-            }
-        }
-        if (k == 'p') {                      // prev camera
-            auto avail = scanCameras(12);
-            if (!avail.empty()) {
-                auto it = std::find(avail.begin(), avail.end(), camIndex);
-                if (it == avail.begin() || it == avail.end()) it = avail.end();
-                --it;
-                int prev = *it;
-                if (openCapture(cap, prev, camW, camH, camFPS)) {
-                    camIndex = prev;
-                #ifdef __linux__
-                    std::cerr << "Switched to [" << camIndex << "] " << v4l2NameFor(camIndex) << "\n";
-                #else
-                    std::cerr << "Switched to [" << camIndex << "]\n";
-                #endif
-                }
-            }
-        }
-        if (k >= '0' && k <= '9') {          // direct select 0..9
-            int idx = k - '0';
-            if (openCapture(cap, idx, camW, camH, camFPS)) {
-                camIndex = idx;
-            #ifdef __linux__
-                std::cerr << "Switched to [" << camIndex << "] " << v4l2NameFor(camIndex) << "\n";
-            #else
-                std::cerr << "Switched to [" << camIndex << "]\n";
-            #endif
-            } else {
-                std::cerr << "Failed to open camera " << idx << "\n";
             }
         }
 

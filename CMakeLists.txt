@@ -4,11 +4,11 @@ project(mthud LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_CXX_EXTENSIONS ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # ---- Options ---------------------------------------------------------------
-option(USE_XSENS "Enable Xsens MT SDK integration" OFF)
+option(USE_XSENS "Enable Xsens MT SDK integration" ON)
 
 # ---- Dependencies via vcpkg / system --------------------------------------
 find_package(Threads REQUIRED)
@@ -73,20 +73,26 @@ if(USE_XSENS)
 
   option(XSENS_USE_STATIC "Use locally built static Xsens libs (xspublic)" OFF)
 
-  # Resolve SDK root from cache var or env
+  # Resolve SDK root from cache var, env, or bundled third_party/xsens
   if(NOT XSENS_SDK_ROOT AND DEFINED ENV{XSENS_SDK_ROOT})
     set(XSENS_SDK_ROOT "$ENV{XSENS_SDK_ROOT}")
   endif()
+  if(NOT XSENS_SDK_ROOT)
+    set(XSENS_SDK_ROOT "${PROJECT_SOURCE_DIR}/third_party/xsens")
+  endif()
   set(XSENS_SDK_ROOT "${XSENS_SDK_ROOT}" CACHE PATH "Path to Xsens MT SDK root (contains include/ and lib/)")
 
-  # Headers
-  if(WIN32)
-    find_path(XSENS_INCLUDE_DIR xsensdeviceapi.h
-      HINTS "${XSENS_SDK_ROOT}/include"
-            "$ENV{ProgramFiles}/Xsens/MT SDK/include")
-  else()
-    find_path(XSENS_INCLUDE_DIR xsensdeviceapi.h
-      HINTS "${XSENS_SDK_ROOT}/include" "/usr/local/xsens/mt-sdk/include")
+  # Validate paths up front and point directly at the bundled copy
+  set(XSENS_INCLUDE_DIR "${XSENS_SDK_ROOT}/include")
+  if(NOT EXISTS "${XSENS_INCLUDE_DIR}/xsensdeviceapi.h")
+    set(_xsens_fallback "${PROJECT_SOURCE_DIR}/third_party/xsens")
+    if(NOT XSENS_SDK_ROOT STREQUAL "${_xsens_fallback}" AND EXISTS "${_xsens_fallback}/include/xsensdeviceapi.h")
+      message(WARNING "XSENS_SDK_ROOT (${XSENS_SDK_ROOT}) invalid; falling back to bundled ${_xsens_fallback}")
+      set(XSENS_SDK_ROOT "${_xsens_fallback}" CACHE PATH "Path to Xsens MT SDK root (contains include/ and lib/)" FORCE)
+      set(XSENS_INCLUDE_DIR "${XSENS_SDK_ROOT}/include")
+    else()
+      message(FATAL_ERROR "Xsens headers not found under ${XSENS_INCLUDE_DIR}. Set XSENS_SDK_ROOT to the SDK root containing include/ and lib/.")
+    endif()
   endif()
 
   if(XSENS_USE_STATIC)
@@ -134,21 +140,19 @@ if(USE_XSENS)
     endif()
   else()
     if(WIN32)
-      # Libs (names vary by SDK version)
-      find_library(XSENS_LIB   NAMES xsensdeviceapi xsensdeviceapi64
-        HINTS "${XSENS_SDK_ROOT}/lib"
-              "$ENV{ProgramFiles}/Xsens/MT SDK/lib"
-              "$ENV{ProgramFiles(x86)}/Xsens/MT SDK/lib")
-      find_library(XSTYPES_LIB NAMES xstypes xstypes64
-        HINTS "${XSENS_SDK_ROOT}/lib"
-              "$ENV{ProgramFiles}/Xsens/MT SDK/lib"
-              "$ENV{ProgramFiles(x86)}/Xsens/MT SDK/lib")
+      set(_xs_lib_dir "${XSENS_SDK_ROOT}/lib")
+      set(XSENS_LIB   "${_xs_lib_dir}/xsensdeviceapi64.lib")
+      set(XSTYPES_LIB "${_xs_lib_dir}/xstypes64.lib")
+      if(NOT EXISTS "${XSENS_LIB}" OR NOT EXISTS "${XSTYPES_LIB}")
+        message(FATAL_ERROR "Xsens libraries not found under ${_xs_lib_dir}. Expected xsensdeviceapi64.lib and xstypes64.lib. Set XSENS_SDK_ROOT if your layout differs.")
+      endif()
     else()
-      # Linux default locations
-      find_library(XSENS_LIB   NAMES xsensdeviceapi
-        HINTS "${XSENS_SDK_ROOT}/lib" "/usr/local/xsens/mt-sdk/lib")
-      find_library(XSTYPES_LIB NAMES xstypes
-        HINTS "${XSENS_SDK_ROOT}/lib" "/usr/local/xsens/mt-sdk/lib")
+      set(_xs_lib_dir "${XSENS_SDK_ROOT}/lib")
+      set(XSENS_LIB   "${_xs_lib_dir}/libxsensdeviceapi.so")
+      set(XSTYPES_LIB "${_xs_lib_dir}/libxstypes.so")
+      if(NOT EXISTS "${XSENS_LIB}" OR NOT EXISTS "${XSTYPES_LIB}")
+        message(FATAL_ERROR "Xsens libraries not found under ${_xs_lib_dir}. Expected libxsensdeviceapi.so and libxstypes.so. Set XSENS_SDK_ROOT if your layout differs.")
+      endif()
 
       # Make runtime find the shared libs
       set_target_properties(mthud PROPERTIES
@@ -163,12 +167,19 @@ if(USE_XSENS)
                 "${XSENS_SDK_ROOT}/lib/libxstypes.so" "$<TARGET_FILE_DIR:mthud>/")
     endif()
 
-    if(NOT XSENS_INCLUDE_DIR OR NOT XSENS_LIB OR NOT XSTYPES_LIB)
-      message(FATAL_ERROR "Xsens SDK not found. Set XSENS_SDK_ROOT to your mt-sdk root (with include/ and lib/).")
-    endif()
-
     target_include_directories(mthud PRIVATE "${XSENS_INCLUDE_DIR}")
     target_link_libraries(mthud PRIVATE "${XSENS_LIB}" "${XSTYPES_LIB}")
+
+    if(WIN32)
+      # Drop the DLLs next to the exe so runtime can find them
+      file(GLOB _XSENS_DLLS "${XSENS_SDK_ROOT}/lib/*.dll")
+      add_custom_command(TARGET mthud POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${_XSENS_DLLS} "$<TARGET_FILE_DIR:mthud>/"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:mthud>/platforms"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${XSENS_SDK_ROOT}/lib/platforms/qwindows.dll"
+                "$<TARGET_FILE_DIR:mthud>/platforms/")
+    endif()
   endif()
 else()
   target_compile_definitions(mthud PRIVATE USE_XSENS=0)
@@ -176,12 +187,30 @@ endif()
 
 # ---- Runtime assets --------------------------------------------------------
 foreach(f calibration.json calibration.yaml)
-  if(EXISTS "${CMAKE_SOURCE_DIR}/src/${f}")
+  if(EXISTS "${CMAKE_SOURCE_DIR}/${f}")
     add_custom_command(TARGET mthud POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy_if_different
-              "${CMAKE_SOURCE_DIR}/src/${f}" "$<TARGET_FILE_DIR:mthud>/")
+              "${CMAKE_SOURCE_DIR}/${f}" "$<TARGET_FILE_DIR:mthud>/")
   endif()
 endforeach()
+
+# Copy OpenCV runtime DLLs next to the executable (helps ensure HighGUI backend is found)
+set(_opencv_bin_dir "")
+if(OpenCV_LIBS)
+  list(GET OpenCV_LIBS 0 _opencv_lib_hint)
+  get_filename_component(_opencv_lib_dir "${_opencv_lib_hint}" DIRECTORY)
+  get_filename_component(_opencv_root "${_opencv_lib_dir}" DIRECTORY)
+  set(_opencv_bin_dir "${_opencv_root}/bin")
+endif()
+if(EXISTS "${_opencv_bin_dir}")
+  file(GLOB _opencv_runtime_dlls "${_opencv_bin_dir}/opencv_*.dll")
+  if(_opencv_runtime_dlls)
+    add_custom_command(TARGET mthud POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+              ${_opencv_runtime_dlls}
+              "$<TARGET_FILE_DIR:mthud>/")
+  endif()
+endif()
 
 # ---- Install (optional) ----------------------------------------------------
 install(TARGETS mthud RUNTIME DESTINATION bin)

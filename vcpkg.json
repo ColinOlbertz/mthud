@@ -23,12 +23,16 @@
       "default-features": false,
       "features": [
         "contrib",
+        "dshow",
+        "ffmpeg",
         "highgui",
         "jpeg",
+        "msmf",
         "png",
         "tiff",
         "webp",
-        "quirc"
+        "quirc",
+        "win32ui"
       ]
     },
     "glfw3",
