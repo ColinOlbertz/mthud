@@ -9,6 +9,11 @@
 #include <string>
 #include <vector>
 
+static double nowSeconds() {
+    using clock = std::chrono::high_resolution_clock;
+    return std::chrono::duration<double>(clock::now().time_since_epoch()).count();
+}
+
 // ---------------- DemoSensor ----------------
 void DemoSensor::start() {
     run = true;
@@ -19,7 +24,7 @@ void DemoSensor::start() {
             auto now = clock::now();
             double t = std::chrono::duration<double>(now - t0).count();
             SensorSample s;
-            s.t_host = t;
+            s.t_host = nowSeconds();
             s.bank_deg = 15.0 * std::sin(t * 0.9);
             s.pitch_deg = 7.0 * std::sin(t * 0.6 + 0.8);
             s.gyro_z_dps = 0.0;
@@ -88,6 +93,7 @@ static const XsFilterProfile* pickHeadingProfile(const XsFilterProfileArray& pro
 class MyXsCallback : public XsCallback {
 public:
     std::atomic<SensorSample> latest{ SensorSample{} };
+    std::atomic<double> last_packet_time{ 0.0 };
 
 private:
     SensorSample last_{ };
@@ -95,8 +101,8 @@ private:
 public:
     void handlePacket(const XsDataPacket* packet) {
         SensorSample s = last_;
-        s.t_host = std::chrono::duration<double>(
-            std::chrono::high_resolution_clock::now().time_since_epoch()).count();
+        s.t_host = nowSeconds();
+        last_packet_time.store(s.t_host, std::memory_order_relaxed);
 
         // --- Orientation ---
         if (packet->containsOrientation()) {
@@ -177,76 +183,30 @@ public:
     void stop() override {
         run = false;
         if (th.joinable()) th.join();
-        if (device) { try { device->gotoConfig(); } catch (...) {} }
+        closeDevice_();
         if (control) {
-            try { if (device) control->closePort(device->portInfo().portName().toStdString()); }
-            catch (...) {}
-            control->destruct(); control = nullptr; device = nullptr;
+            control->destruct(); control = nullptr;
         }
     }
     SensorSample latest() const override { return cb.latest.load(std::memory_order_relaxed); }
     ~XsensSensorImpl() { stop(); }
 
 private:
+    void closeDevice_() {
+        if (device) {
+            try { device->removeCallbackHandler(&cb); } catch (...) {}
+            try { device->gotoConfig(); } catch (...) {}
+        }
+        if (control && device) {
+            try { control->closePort(device->portInfo().portName().toStdString()); }
+            catch (...) {}
+        }
+        device = nullptr;
+    }
+
     void threadMain() {
         control = XsControl::construct();
         if (!control) { std::cerr << "XsControl::construct failed\n"; return; }
-
-        // Build port/baud selection close to the official example
-        XsPortInfo chosen;
-        XsBaudRate chosenBaud = XBR_Invalid;
-
-        // Env override: XSENS_PORT + optional XSENS_BAUD
-        if (const char* envPort = std::getenv("XSENS_PORT")) {
-            if (*envPort) {
-                std::string portStr(envPort);
-                if (const char* envBaud = std::getenv("XSENS_BAUD")) {
-                    long b = std::strtol(envBaud, nullptr, 10);
-                    if (b > 0) chosenBaud = XsBaud::numericToRate(int(b));
-                }
-                chosen.setPortName(XsString(portStr.c_str()));
-                chosen.setBaudrate(chosenBaud);
-                std::cerr << "XSENS_PORT override: " << portStr;
-                if (chosenBaud != XBR_Invalid) std::cerr << " baud " << XsBaud::rateToNumeric(chosenBaud);
-                std::cerr << "\n";
-            }
-        }
-
-        // If no override, use scanner result (first MTi)
-        if (chosen.portName().empty()) {
-            XsPortInfoArray ports = XsScanner::scanPorts();
-            std::cerr << "Xsens scan found " << ports.size() << " ports\n";
-            for (const auto& p : ports) {
-                std::cerr << "  " << p.portName().toStdString()
-                          << " id=" << p.deviceId().toString().toStdString()
-                          << " baud=" << (int)p.baudrate()
-                          << (p.deviceId().isMti() || p.deviceId().isMtig() ? " [MTi]" : "")
-                          << "\n";
-                if (chosen.portName().empty() && (p.deviceId().isMti() || p.deviceId().isMtig())) {
-                    chosen = p;
-                }
-            }
-        }
-
-        if (chosen.portName().empty()) { std::cerr << "No MTi device found\n"; return; }
-        if (chosenBaud == XBR_Invalid) {
-            chosenBaud = chosen.baudrate();
-            if (chosenBaud == XBR_Invalid) chosenBaud = XBR_115k2; // fallback
-        }
-
-        std::string portStr = chosen.portName().toStdString();
-        std::cerr << "Opening " << portStr << " at " << XsBaud::rateToNumeric(chosenBaud) << "\n";
-        if (!control->openPort(portStr, chosenBaud)) {
-            std::cerr << "openPort failed: " << control->lastResultText().toStdString()
-                      << " (" << (int)control->lastResult() << ")\n";
-            return;
-        }
-
-        device = control->device(chosen.deviceId());
-        if (!device) { device = control->device(XsDeviceId()); }
-        if (!device) { std::cerr << "Failed to get device handle\n"; return; }
-
-        if (!device->gotoConfig()) { std::cerr << "gotoConfig failed\n"; return; }
 
         auto setHeadingProfile = [&]() -> bool {
             if (!device) return false;
@@ -278,27 +238,112 @@ private:
             return false;
         };
 
-        setHeadingProfile();
+        auto openAndConfigure = [&]() -> bool {
+            // Build port/baud selection close to the official example
+            XsPortInfo chosen;
+            XsBaudRate chosenBaud = XBR_Invalid;
 
-        // === Output configuration (your SDK ids) ===
-        XsOutputConfigurationArray cfgs;
-        // Use ids you listed: XDI_EulerAngles, XDI_VelocityXYZ, XDI_BaroPressure, XDI_LatLon, XDI_AltitudeMsl, XDI_GnssSatInfo
-        // Start minimal: Euler at 200 Hz (tune if needed)
-        cfgs.push_back(XsOutputConfiguration(XDI_EulerAngles, 400));
-        cfgs.push_back(XsOutputConfiguration(XDI_VelocityXYZ, 50));
-        cfgs.push_back(XsOutputConfiguration(XDI_BaroPressure, 50));
-        cfgs.push_back(XsOutputConfiguration(XDI_LatLon, 50));
-        cfgs.push_back(XsOutputConfiguration(XDI_AltitudeMsl, 50));
-        cfgs.push_back(XsOutputConfiguration(XDI_GnssSatInfo, 1));
+            // Env override: XSENS_PORT + optional XSENS_BAUD
+            if (const char* envPort = std::getenv("XSENS_PORT")) {
+                if (*envPort) {
+                    std::string portStr(envPort);
+                    if (const char* envBaud = std::getenv("XSENS_BAUD")) {
+                        long b = std::strtol(envBaud, nullptr, 10);
+                        if (b > 0) chosenBaud = XsBaud::numericToRate(int(b));
+                    }
+                    chosen.setPortName(XsString(portStr.c_str()));
+                    chosen.setBaudrate(chosenBaud);
+                    std::cerr << "XSENS_PORT override: " << portStr;
+                    if (chosenBaud != XBR_Invalid) std::cerr << " baud " << XsBaud::rateToNumeric(chosenBaud);
+                    std::cerr << "\n";
+                }
+            }
 
-        if (!device->setOutputConfiguration(cfgs)) {
-            std::cerr << "setOutputConfiguration failed (try lower rates)\n"; return;
+            // If no override, use scanner result (first MTi)
+            if (chosen.portName().empty()) {
+                XsPortInfoArray ports = XsScanner::scanPorts();
+                std::cerr << "Xsens scan found " << ports.size() << " ports\n";
+                for (const auto& p : ports) {
+                    std::cerr << "  " << p.portName().toStdString()
+                              << " id=" << p.deviceId().toString().toStdString()
+                              << " baud=" << (int)p.baudrate()
+                              << (p.deviceId().isMti() || p.deviceId().isMtig() ? " [MTi]" : "")
+                              << "\n";
+                    if (chosen.portName().empty() && (p.deviceId().isMti() || p.deviceId().isMtig())) {
+                        chosen = p;
+                    }
+                }
+            }
+
+            if (chosen.portName().empty()) { std::cerr << "No MTi device found\n"; return false; }
+            if (chosenBaud == XBR_Invalid) {
+                chosenBaud = chosen.baudrate();
+                if (chosenBaud == XBR_Invalid) chosenBaud = XBR_115k2; // fallback
+            }
+
+            std::string portStr = chosen.portName().toStdString();
+            std::cerr << "Opening " << portStr << " at " << XsBaud::rateToNumeric(chosenBaud) << "\n";
+            if (!control->openPort(portStr, chosenBaud)) {
+                std::cerr << "openPort failed: " << control->lastResultText().toStdString()
+                          << " (" << (int)control->lastResult() << ")\n";
+                return false;
+            }
+
+            device = control->device(chosen.deviceId());
+            if (!device) { device = control->device(XsDeviceId()); }
+            if (!device) { std::cerr << "Failed to get device handle\n"; return false; }
+
+            if (!device->gotoConfig()) { std::cerr << "gotoConfig failed\n"; return false; }
+
+            setHeadingProfile();
+
+            // === Output configuration (your SDK ids) ===
+            XsOutputConfigurationArray cfgs;
+            // Use ids you listed: XDI_EulerAngles, XDI_VelocityXYZ, XDI_BaroPressure, XDI_LatLon, XDI_AltitudeMsl, XDI_GnssSatInfo
+            // Start minimal: Euler at 200 Hz (tune if needed)
+            cfgs.push_back(XsOutputConfiguration(XDI_EulerAngles, 400));
+            cfgs.push_back(XsOutputConfiguration(XDI_VelocityXYZ, 50));
+            cfgs.push_back(XsOutputConfiguration(XDI_BaroPressure, 50));
+            cfgs.push_back(XsOutputConfiguration(XDI_LatLon, 50));
+            cfgs.push_back(XsOutputConfiguration(XDI_AltitudeMsl, 50));
+            cfgs.push_back(XsOutputConfiguration(XDI_GnssSatInfo, 1));
+
+            if (!device->setOutputConfiguration(cfgs)) {
+                std::cerr << "setOutputConfiguration failed (try lower rates)\n";
+                return false;
+            }
+
+            device->addCallbackHandler(&cb);
+            if (!device->gotoMeasurement()) { std::cerr << "gotoMeasurement failed\n"; return false; }
+            return true;
+        };
+
+        constexpr double kDataTimeoutSec = 1.0;
+        constexpr double kInitialTimeoutSec = 2.0;
+
+        while (run) {
+            closeDevice_();
+            cb.last_packet_time.store(0.0, std::memory_order_relaxed);
+            if (!openAndConfigure()) {
+                closeDevice_();
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                continue;
+            }
+
+            const double start_s = nowSeconds();
+            while (run) {
+                const double last_s = cb.last_packet_time.load(std::memory_order_relaxed);
+                const double now_s = nowSeconds();
+                if ((last_s > 0.0 && (now_s - last_s) > kDataTimeoutSec) ||
+                    (last_s <= 0.0 && (now_s - start_s) > kInitialTimeoutSec)) {
+                    std::cerr << "Xsens data timeout; reconnecting\n";
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
         }
 
-        device->addCallbackHandler(&cb);
-        if (!device->gotoMeasurement()) { std::cerr << "gotoMeasurement failed\n"; return; }
-
-        while (run) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        closeDevice_();
     }
 };
 #endif // USE_XSENS

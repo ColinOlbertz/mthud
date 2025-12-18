@@ -33,6 +33,11 @@ static const float PI = 3.14159265358979323846f;
 
 static const float HINV_ID[9] = { 1,0,0,  0,1,0,  0,0,1 };
 
+static double nowSeconds() {
+    using clock = std::chrono::high_resolution_clock;
+    return std::chrono::duration<double>(clock::now().time_since_epoch()).count();
+}
+
 namespace fs = std::filesystem;
 static fs::path configPath(const char* filename) {
     // Always resolve relative to the project root so configs live in mthud/
@@ -1253,6 +1258,7 @@ int main(int argc, char** argv) {
     // --- smoothing state
     double spd_kt_smooth = 0.0, alt_ft_smooth = 0.0;
     bool   first_samples = true;
+    bool   sensor_was_ok = false;
 
     while (g_running) {
         g_clk.begin();
@@ -1460,6 +1466,17 @@ int main(int argc, char** argv) {
 
         // --- Sensor → derived readouts
         SensorSample s = sensor->latest();
+        const double now_s = nowSeconds();
+        constexpr double SENSOR_TIMEOUT_SEC = 0.5;
+        const bool sensor_ok = std::isfinite(s.t_host) && s.t_host > 0.0 &&
+            (now_s - s.t_host) <= SENSOR_TIMEOUT_SEC;
+        if (sensor_ok && !sensor_was_ok) {
+            first_samples = true;
+        }
+        sensor_was_ok = sensor_ok;
+        if (!sensor_ok) {
+            s = SensorSample{};
+        }
 
         double Vn = s.vel_x_ms;
         double Ve = s.vel_y_ms;
@@ -1522,6 +1539,8 @@ int main(int argc, char** argv) {
         hs.text_scale = std::max(0.2f, TB_text_scale_pct / 100.0f);
         hs.flip_text_x = TB_text_flip_x;
         hs.flip_text_y = TB_text_flip_y;
+        hs.draw_hud = sensor_ok;
+        hs.show_sensor_disconnected = !sensor_ok;
 
         hs.fpm_dx_deg = float(dx_rad * 180.0 / PI);
         hs.fpm_dy_deg = float(dy_rad * 180.0 / PI);

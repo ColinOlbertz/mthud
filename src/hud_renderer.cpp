@@ -203,8 +203,17 @@ void HudRenderer::setTextUniforms_(int CW, int CH, float angle, float Tx, float 
     glUniform1f(uTxtAlpha_, alpha);
 }
 
+static std::string textCacheKey(const std::string& text, uint8_t r, uint8_t g, uint8_t b) {
+    return text + "|c:" + std::to_string(int(r)) + "," + std::to_string(int(g)) + "," + std::to_string(int(b));
+}
+
 const HudRenderer::TextCacheEntry& HudRenderer::getTextEntry_(const std::string& text) {
-    auto it = textCache_.find(text);
+    return getTextEntry_(text, 0, 255, 0);
+}
+
+const HudRenderer::TextCacheEntry& HudRenderer::getTextEntry_(const std::string& text, uint8_t r, uint8_t g, uint8_t b) {
+    const std::string key = textCacheKey(text, r, g, b);
+    auto it = textCache_.find(key);
     if (it != textCache_.end()) {
         // refresh LRU
         textCacheLru_.splice(textCacheLru_.end(), textCacheLru_, it->second.lruIt);
@@ -216,7 +225,8 @@ const HudRenderer::TextCacheEntry& HudRenderer::getTextEntry_(const std::string&
     cv::Size sz = cv::getTextSize(text, cv::FONT_HERSHEY_SIMPLEX, fontScale, thickness, &baseline);
     int Wpx = std::max(8, sz.width + 8), Hpx = Htex + 8;
     cv::Mat rgba(Hpx, Wpx, CV_8UC4, cv::Scalar(0, 0, 0, 0));
-    cv::putText(rgba, text, { 4, Htex }, cv::FONT_HERSHEY_SIMPLEX, fontScale, cv::Scalar(0, 255, 0, 255), thickness, cv::LINE_AA);
+    cv::putText(rgba, text, { 4, Htex }, cv::FONT_HERSHEY_SIMPLEX, fontScale,
+        cv::Scalar(b, g, r, 255), thickness, cv::LINE_AA);
 
     TextCacheEntry entry;
     entry.width = rgba.cols;
@@ -231,9 +241,9 @@ const HudRenderer::TextCacheEntry& HudRenderer::getTextEntry_(const std::string&
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, rgba.cols, rgba.rows, 0, GL_BGRA, GL_UNSIGNED_BYTE, rgba.data);
 
-    textCacheLru_.push_back(text);
+    textCacheLru_.push_back(key);
     entry.lruIt = std::prev(textCacheLru_.end());
-    auto [insIt, _] = textCache_.emplace(text, std::move(entry));
+    auto [insIt, _] = textCache_.emplace(key, std::move(entry));
 
     // LRU eviction to keep memory bounded
     if (textCache_.size() > kMaxTextCache_) {
@@ -262,10 +272,11 @@ void HudRenderer::drawTextLabelPx_(const std::string& text,
     float ang, float centerX, float centerY,
     float pivotX, float pivotY,
     int CW, int CH, float alpha,
-    float flipX, float flipY) {
+    float flipX, float flipY,
+    uint8_t r, uint8_t g, uint8_t b) {
     if (text.empty() || h_px <= 0) return;
 
-    const TextCacheEntry& tex = getTextEntry_(text);
+    const TextCacheEntry& tex = getTextEntry_(text, r, g, b);
     if (tex.tex == 0 || tex.height <= 0) return;
 
     // scale bitmap to requested height in canvas px
@@ -320,6 +331,21 @@ void HudRenderer::draw(const HudState& s) {
     auto rot2 = [&](float x, float y) { 
         return std::pair<float, float>(cr * x - sr * y, sr * x + cr * y); 
     };
+
+    if (!s.draw_hud) {
+        if (s.show_sensor_disconnected) {
+            const std::string msg = "Sensor disconnected";
+            const float compCenterY_px = -1.15f * (CH * 0.5f);
+            const float compR_px = 0.85f * arcRadius_px_;
+            const float h = 34.f * std::max(0.2f, s.text_scale);
+            const float w_est = 0.6f * h * float(msg.size());
+            const float anchor_y = compCenterY_px + compR_px + (0.6f * h) + 8.f;
+            drawTextLabelPx_(msg, -0.5f * w_est, -0.5f * h, h, 0.0f,
+                0.0f, anchor_y, 0.0f, 0.0f, CW, CH,
+                0.95f, float(s.flip_text_x), float(s.flip_text_y), 255, 0, 0);
+        }
+        return;
+    }
 
     // regen arcs if changed
     ensureTopArc_(CW, CH);

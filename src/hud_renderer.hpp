@@ -5,6 +5,7 @@
 #include <unordered_map>
 #include <list>
 #include <limits>
+#include <cstdint>
 
 struct HudState {
     // aircraft state
@@ -40,6 +41,10 @@ struct HudState {
     float text_scale{ 2.0f };   // multiplier for label size (e.g., 1.2 = +20%)
     int   flip_text_x{ 1 };     // 0/1 mirror horizontally
     int   flip_text_y{ 0 };     // 0/1 mirror vertically
+
+    // sensor status
+    bool  draw_hud{ true };
+    bool  show_sensor_disconnected{ false };
 
 };
 
@@ -104,6 +109,7 @@ private:
     void setTextUniforms_(int CW, int CH, float angle_rad, float Tx, float Ty, float Px, float Py, float alpha);
 
     const TextCacheEntry& getTextEntry_(const std::string& text);
+    const TextCacheEntry& getTextEntry_(const std::string& text, uint8_t r, uint8_t g, uint8_t b);
     void clearTextCache_();
 
     // draw a label whose quad is defined in canvas pixels, local origin at (x_px,y_px) relative to (centerX,centerY)
@@ -112,7 +118,8 @@ private:
         float ang, float centerX, float centerY,
         float pivotX, float pivotY,
         int CW, int CH, float alpha = 0.95f,
-        float flipX = 0.0f, float flipY = 0.0f);
+        float flipX = 0.0f, float flipY = 0.0f,
+        uint8_t r = 0, uint8_t g = 255, uint8_t b = 0);
 
     void fillRect_(int CW, int CH,
         float cx, float cy, float w, float h,
