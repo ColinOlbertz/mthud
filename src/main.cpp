@@ -10,10 +10,21 @@
 #include <optional>
 #include <chrono>
 #include <filesystem>
+#include <sstream>
+#include <cwctype>
 
 #include <thread>
 #include <mutex>
 #include <atomic>
+
+#ifdef _WIN32
+  #ifndef NOMINMAX
+    #define NOMINMAX
+  #endif
+  #include <windows.h>
+  #include <mfapi.h>
+  #include <mfidl.h>
+#endif
 
 #include <opencv2/opencv.hpp>
 #include <opencv2/aruco.hpp>
@@ -67,6 +78,14 @@ static std::optional<std::string> getEnvString(const char* key) {
 #endif
 }
 
+static bool envFlag(const char* key, bool fallback = false) {
+    auto env = getEnvString(key);
+    if (!env || env->empty()) return fallback;
+    std::string s(*env);
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c){ return std::tolower(c); });
+    return !(s == "0" || s == "false" || s == "off" || s == "no");
+}
+
 static int backendFromEnv() {
     if (auto env = getEnvString("CAM_BACKEND")) {
         std::string s(*env);
@@ -79,16 +98,70 @@ static int backendFromEnv() {
     return -1;
 }
 
-static int preferredBackend() {
+static const char* backendName(int backend) {
+    switch (backend) {
+    case cv::CAP_DSHOW: return "DSHOW";
+    case cv::CAP_MSMF:  return "MSMF";
+    case cv::CAP_V4L2:  return "V4L2";
+    case cv::CAP_ANY:   return "ANY";
+    default:            return "UNKNOWN";
+    }
+}
+
+static std::vector<int> backendPreference() {
+    std::vector<int> backends;
+    auto pushUnique = [&](int b) {
+        if (std::find(backends.begin(), backends.end(), b) == backends.end()) backends.push_back(b);
+    };
+
     int env = backendFromEnv();
-    if (env >= 0) return env;
+    if (env >= 0) pushUnique(env);
+
 #if defined(_WIN32)
-    return cv::CAP_DSHOW; // DirectShow tends to be most reliable; override with CAM_BACKEND if needed
+    // UVC cameras vary by driver. Epson/BT camera paths are often happier with MSMF,
+    // while many webcams still prefer DirectShow, so probe both explicitly.
+    pushUnique(cv::CAP_MSMF);
+    pushUnique(cv::CAP_DSHOW);
+    pushUnique(cv::CAP_ANY);
 #elif defined(__linux__)
-    return cv::CAP_V4L2;
+    pushUnique(cv::CAP_V4L2);
+    pushUnique(cv::CAP_ANY);
 #else
-    return cv::CAP_ANY;
+    pushUnique(cv::CAP_ANY);
 #endif
+    return backends;
+}
+
+static int fourccFromString(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c){ return std::toupper(c); });
+    if (s == "NONE" || s == "DEFAULT" || s == "AUTO") return 0;
+    if (s.size() == 4) return cv::VideoWriter::fourcc(s[0], s[1], s[2], s[3]);
+    return 0;
+}
+
+static std::vector<int> fourccPreference() {
+    std::vector<int> codes;
+    if (auto env = getEnvString("CAM_FOURCC"); env && !env->empty()) {
+        std::stringstream ss(*env);
+        std::string item;
+        while (std::getline(ss, item, ',')) codes.push_back(fourccFromString(item));
+    }
+    if (codes.empty()) {
+#if defined(_WIN32)
+        codes = {
+            cv::VideoWriter::fourcc('M','J','P','G'),
+            cv::VideoWriter::fourcc('Y','U','Y','2'),
+            0
+        };
+#else
+        codes = {
+            0,
+            cv::VideoWriter::fourcc('M','J','P','G'),
+            cv::VideoWriter::fourcc('Y','U','Y','2')
+        };
+#endif
+    }
+    return codes;
 }
 
 #ifdef __linux__
@@ -106,13 +179,87 @@ static std::string v4l2NameFor(int idx) {
 }
 #endif
 
+#ifdef _WIN32
+static std::wstring widenForWindows(const std::string& s) {
+    if (s.empty()) return {};
+    int len = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
+    UINT cp = CP_UTF8;
+    if (len <= 0) {
+        cp = CP_ACP;
+        len = MultiByteToWideChar(cp, 0, s.c_str(), -1, nullptr, 0);
+    }
+    if (len <= 0) return {};
+    std::wstring out(size_t(len - 1), L'\0');
+    MultiByteToWideChar(cp, 0, s.c_str(), -1, out.data(), len);
+    return out;
+}
+
+static std::wstring lowerWide(std::wstring s) {
+    std::transform(s.begin(), s.end(), s.begin(), [](wchar_t c) { return wchar_t(std::towlower(c)); });
+    return s;
+}
+
+static std::optional<int> mfCameraIndexByName(const std::string& nameNeedle) {
+    std::wstring needle = lowerWide(widenForWindows(nameNeedle));
+    if (needle.empty()) return std::nullopt;
+
+    HRESULT coHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const bool didCoInit = SUCCEEDED(coHr);
+    if (FAILED(coHr) && coHr != RPC_E_CHANGED_MODE) return std::nullopt;
+    if (FAILED(MFStartup(MF_VERSION))) {
+        if (didCoInit) CoUninitialize();
+        return std::nullopt;
+    }
+
+    IMFAttributes* attrs = nullptr;
+    IMFActivate** devices = nullptr;
+    UINT32 count = 0;
+    std::optional<int> found;
+
+    if (SUCCEEDED(MFCreateAttributes(&attrs, 1)) &&
+        SUCCEEDED(attrs->SetGUID(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
+                                 MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID)) &&
+        SUCCEEDED(MFEnumDeviceSources(attrs, &devices, &count))) {
+        for (UINT32 i = 0; i < count; ++i) {
+            WCHAR* friendlyName = nullptr;
+            UINT32 friendlyNameLen = 0;
+            if (SUCCEEDED(devices[i]->GetAllocatedString(MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME,
+                                                         &friendlyName, &friendlyNameLen))) {
+                std::wstring candidate = lowerWide(std::wstring(friendlyName, friendlyNameLen));
+                CoTaskMemFree(friendlyName);
+                if (candidate.find(needle) != std::wstring::npos) {
+                    found = static_cast<int>(i);
+                    break;
+                }
+            }
+        }
+    }
+
+    if (devices) {
+        for (UINT32 i = 0; i < count; ++i) {
+            if (devices[i]) devices[i]->Release();
+        }
+        CoTaskMemFree(devices);
+    }
+    if (attrs) attrs->Release();
+    MFShutdown();
+    if (didCoInit) CoUninitialize();
+    return found;
+}
+#endif
+
 static std::vector<int> scanCameras(int maxIdx = 12) {
     std::vector<int> ok;
-    const int primary = preferredBackend();
+    const auto backends = backendPreference();
     for (int i = 0; i <= maxIdx; ++i) {
-        cv::VideoCapture t;
-        if (t.open(i, primary) || (primary != cv::CAP_ANY && t.open(i, cv::CAP_ANY))) {
-            if (t.isOpened()) ok.push_back(i);
+        for (int backend : backends) {
+            cv::VideoCapture t;
+            if (!t.open(i, backend)) continue;
+            cv::Mat probe;
+            if (t.read(probe) && !probe.empty()) {
+                ok.push_back(i);
+                break;
+            }
         }
     }
     return ok;
@@ -133,23 +280,113 @@ static void lockCameraParams(cv::VideoCapture& cap) {
 }
 
 static bool openCapture(cv::VideoCapture& cap, int index,
-                        int w, int h, double fps) {
+                        int w, int h, double fps,
+                        int* openedIndex = nullptr,
+                        bool honorNamedSource = true) {
     cap.release();
-    const int primary = preferredBackend();
-    const int backends[] = { primary, cv::CAP_ANY };
+    const auto backends = backendPreference();
+    const auto fourccs = fourccPreference();
+    const bool debug = envFlag("CAM_DEBUG", false);
 
-    for (int backend : backends) {
-        if (backend == cv::CAP_ANY && primary == cv::CAP_ANY) continue; // avoid duplicate attempt
-        if (!cap.open(index, backend)) continue;
+    auto configure = [&](int fourcc) {
+        if (fourcc != 0) cap.set(cv::CAP_PROP_FOURCC, fourcc);
         if (w > 0) cap.set(cv::CAP_PROP_FRAME_WIDTH,  w);
         if (h > 0) cap.set(cv::CAP_PROP_FRAME_HEIGHT, h);
         if (fps > 0) cap.set(cv::CAP_PROP_FPS, fps);
         cap.set(cv::CAP_PROP_BUFFERSIZE, 1);
-        lockCameraParams(cap);
-        cv::Mat probe;
-        if (cap.read(probe) && !probe.empty()) return true;
-        cap.release();
+#ifdef _WIN32
+        cap.set(cv::CAP_PROP_CONVERT_RGB, 1);
+        cap.set(cv::CAP_PROP_HW_ACCELERATION, (double)cv::VIDEO_ACCELERATION_NONE);
+#endif
+    };
+
+    auto probe = [&]() {
+        cv::Mat probeFrame;
+        for (int tries = 0; tries < 8; ++tries) {
+            if (cap.grab() && cap.retrieve(probeFrame) && !probeFrame.empty()) return true;
+        }
+        return false;
+    };
+
+#if defined(_WIN32)
+    if (honorNamedSource) {
+        if (auto name = getEnvString("CAM_NAME"); name && !name->empty()) {
+            if (auto mfIdx = mfCameraIndexByName(*name)) {
+                std::cerr << "Resolved camera name \"" << *name << "\" to Media Foundation index " << *mfIdx << "\n";
+                for (int backend : backends) {
+                    for (int fourcc : fourccs) {
+                        if (debug) std::cerr << "Trying resolved camera index " << *mfIdx << " via "
+                                             << backendName(backend) << " fourcc=" << fourcc << "\n";
+                        if (!cap.open(*mfIdx, backend)) continue;
+                        configure(fourcc);
+                        if (probe()) {
+                            std::cerr << "Opened camera \"" << *name << "\" at index " << *mfIdx
+                                      << " via " << backendName(backend) << "\n";
+                            if (openedIndex) *openedIndex = *mfIdx;
+                            return true;
+                        }
+                        cap.release();
+                    }
+                }
+            }
+
+            const std::string source = "video=" + *name;
+            for (int fourcc : fourccs) {
+                if (debug) std::cerr << "Trying named camera \"" << *name << "\" via DSHOW fourcc=" << fourcc << "\n";
+                if (!cap.open(source, cv::CAP_DSHOW)) continue;
+                configure(fourcc);
+                if (probe()) {
+                    std::cerr << "Opened named camera \"" << *name << "\" via DSHOW\n";
+                    if (openedIndex) *openedIndex = -1;
+                    return true;
+                }
+                cap.release();
+            }
+        }
     }
+#endif
+
+    if (honorNamedSource) {
+        if (auto url = getEnvString("CAM_URL"); url && !url->empty()) {
+            const int urlBackends[] = { cv::CAP_FFMPEG, cv::CAP_ANY };
+            for (int backend : urlBackends) {
+                if (debug) std::cerr << "Trying camera URL via " << backendName(backend) << "\n";
+                if (!cap.open(*url, backend)) continue;
+                configure(0);
+                if (probe()) {
+                    std::cerr << "Opened camera URL via " << backendName(backend) << "\n";
+                    if (openedIndex) *openedIndex = -1;
+                    return true;
+                }
+                cap.release();
+            }
+        }
+    }
+
+    for (int backend : backends) {
+        for (int fourcc : fourccs) {
+            if (debug) std::cerr << "Trying camera index " << index << " via "
+                                 << backendName(backend) << " fourcc=" << fourcc << "\n";
+            if (!cap.open(index, backend)) continue;
+            configure(fourcc);
+            if (probe()) {
+                if (envFlag("CAM_LOCK_CONTROLS",
+#ifdef _WIN32
+                            false
+#else
+                            true
+#endif
+                            )) {
+                    lockCameraParams(cap);
+                }
+                std::cerr << "Opened camera index " << index << " via " << backendName(backend) << "\n";
+                if (openedIndex) *openedIndex = index;
+                return true;
+            }
+            cap.release();
+        }
+    }
+
     return false;
 }
 
@@ -162,6 +399,14 @@ static int parseCamIndex(int argc, char** argv, int fallback = 0) {
         if (end && *end == '\0') return int(v);
     }
     return fallback;
+}
+
+static bool hasArg(int argc, char** argv, const char* shortName, const char* longName) {
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == shortName || a == longName) return true;
+    }
+    return false;
 }
 
 // ===== GPU warp: HUD-only -> image space via inverse homography =====
@@ -1026,6 +1271,10 @@ int main(int argc, char** argv) {
         }
         return def;
     };
+    auto envIntAny = [](const char* k, int def)->int {
+        if (auto e = getEnvString(k); e && !e->empty()) return std::atoi(e->c_str());
+        return def;
+    };
     auto envDouble = [](const char* k, double def)->double {
         if (auto e = getEnvString(k)) {
             double v = std::atof(e->c_str());
@@ -1055,16 +1304,54 @@ int main(int argc, char** argv) {
     cv::setUseOptimized(true);
     cv::setNumThreads(6);      // often best for ArUco; test 2..6
 
+    if (hasArg(argc, argv, "-l", "--list-cameras")) {
+        const int maxIdx = envInt("CAM_SCAN_MAX", 12);
+        std::cerr << "Camera backends:";
+        for (int backend : backendPreference()) std::cerr << " " << backendName(backend);
+        std::cerr << "\n";
+        std::cerr << "Camera formats:";
+        for (int fourcc : fourccPreference()) std::cerr << " " << fourcc;
+        std::cerr << "\n";
+        auto avail = scanCameras(maxIdx);
+        std::cerr << "Cameras found:";
+        if (avail.empty()) {
+            std::cerr << " none\n";
+        } else {
+            std::cerr << "\n";
+            for (int idx : avail) std::cerr << "  [" << idx << "]\n";
+        }
+        return avail.empty() ? 2 : 0;
+    }
+
+    if (hasArg(argc, argv, "-p", "--probe-camera")) {
+        cv::VideoCapture probeCap;
+        int openedIndex = camIndex;
+        bool ok = openCapture(probeCap, camIndex, camW, camH, camFPS, &openedIndex);
+        if (!ok) {
+            std::cerr << "Camera probe failed for index " << camIndex << "\n";
+            return 3;
+        }
+        std::cerr << "Camera probe OK for index " << openedIndex
+                  << " size=" << probeCap.get(cv::CAP_PROP_FRAME_WIDTH)
+                  << "x" << probeCap.get(cv::CAP_PROP_FRAME_HEIGHT)
+                  << " fps=" << probeCap.get(cv::CAP_PROP_FPS)
+                  << " fourcc=" << probeCap.get(cv::CAP_PROP_FOURCC) << "\n";
+        return 0;
+    }
 
     cv::VideoCapture cap;
-    bool cameraAvailable = openCapture(cap, camIndex, camW, camH, camFPS);
+    int openedIndex = camIndex;
+    bool cameraAvailable = openCapture(cap, camIndex, camW, camH, camFPS, &openedIndex);
+    if (cameraAvailable) camIndex = openedIndex;
     if (!cameraAvailable) {
         auto avail = scanCameras(12);
         if (avail.empty()) {
             std::cerr << "No camera could be opened. Continuing without video input.\n";
         } else {
             camIndex = avail.front();
-            cameraAvailable = openCapture(cap, camIndex, camW, camH, camFPS);
+            openedIndex = camIndex;
+            cameraAvailable = openCapture(cap, camIndex, camW, camH, camFPS, &openedIndex);
+            if (cameraAvailable) camIndex = openedIndex;
             if (!cameraAvailable) {
                 std::cerr << "Failed to open first available camera; running HUD without camera.\n";
             }
@@ -1082,8 +1369,8 @@ int main(int argc, char** argv) {
     }
     #endif
 
-    // Optional MJPG request
-    if (cameraAvailable) {
+    // Optional late MJPG request. Normally the open probe already chose a working format.
+    if (cameraAvailable && envFlag("CAM_FORCE_MJPG", false)) {
         cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M','J','P','G'));
     }
 
@@ -1099,16 +1386,20 @@ int main(int argc, char** argv) {
     }
     cv::Size imgSize = frame.size();
     // --- Start UI thread (OpenCV camera + trackbars)
-    bool uiAvailable = true;
-    try {
-        cv::namedWindow("__hud_ui_probe__", cv::WINDOW_NORMAL);
-        cv::destroyWindow("__hud_ui_probe__");
-    } catch (const cv::Exception& e) {
-        uiAvailable = false;
-        std::cerr << "OpenCV UI backend not available; running headless. " << e.what() << "\n";
-    } catch (...) {
-        uiAvailable = false;
-        std::cerr << "OpenCV UI backend not available; running headless.\n";
+    bool uiAvailable = envFlag("HUD_UI", true);
+    if (uiAvailable) {
+        try {
+            cv::namedWindow("__hud_ui_probe__", cv::WINDOW_NORMAL);
+            cv::destroyWindow("__hud_ui_probe__");
+        } catch (const cv::Exception& e) {
+            uiAvailable = false;
+            std::cerr << "OpenCV UI backend not available; running headless. " << e.what() << "\n";
+        } catch (...) {
+            uiAvailable = false;
+            std::cerr << "OpenCV UI backend not available; running headless.\n";
+        }
+    } else {
+        std::cerr << "OpenCV UI disabled by HUD_UI=0.\n";
     }
     std::thread uiThread;
     if (uiAvailable) {
@@ -1227,7 +1518,10 @@ int main(int argc, char** argv) {
             glfwMakeContextCurrent(win);
             return;
         }
-        std::cerr << "Creating overlay on Monitor[" << idx << "]\n";
+        GLFWmonitor** mons = glfwGetMonitors(&mc);
+        const char* monName = (mons && idx >= 0 && idx < mc) ? glfwGetMonitorName(mons[idx]) : nullptr;
+        std::cerr << "Creating overlay on Monitor[" << idx << "]"
+                  << (monName ? " " : "") << (monName ? monName : "") << "\n";
         hudOverlay = createOverlayWindow(win, idx, /*transparent*/false, /*borderless*/true);
         if (!hudOverlay) {
             std::cerr << "createOverlayWindow failed\n";
@@ -1250,9 +1544,28 @@ int main(int argc, char** argv) {
         currentOverlayIdx = idx;
     };
 
-    {
+    auto logMonitors = []() {
         int mc = 0; glfwGetMonitors(&mc);
-        recreateOverlayAt(mc > 1 ? 1 : 0);
+        GLFWmonitor** mons = glfwGetMonitors(&mc);
+        std::cerr << "GLFW monitors found: " << mc << "\n";
+        for (int i = 0; i < mc; ++i) {
+            int x = 0, y = 0;
+            glfwGetMonitorPos(mons[i], &x, &y);
+            const GLFWvidmode* mode = glfwGetVideoMode(mons[i]);
+            std::cerr << "  [" << i << "] " << (glfwGetMonitorName(mons[i]) ? glfwGetMonitorName(mons[i]) : "(unnamed)")
+                      << " pos=" << x << "," << y;
+            if (mode) std::cerr << " mode=" << mode->width << "x" << mode->height << "@" << mode->refreshRate;
+            std::cerr << "\n";
+        }
+    };
+
+    if (envFlag("HUD_OVERLAY", true)) {
+        int mc = 0; glfwGetMonitors(&mc);
+        logMonitors();
+        const int requestedMonitor = envIntAny("HUD_MONITOR", mc > 1 ? 1 : 0);
+        recreateOverlayAt(requestedMonitor);
+    } else {
+        std::cerr << "HUD overlay disabled by HUD_OVERLAY=0.\n";
     }
 
     // --- smoothing state
@@ -1624,7 +1937,7 @@ int main(int argc, char** argv) {
                     auto it = std::find(avail.begin(), avail.end(), camIndex);
                     if (it == avail.end() || ++it == avail.end()) it = avail.begin();
                     int next = *it;
-                    if (openCapture(cap, next, camW, camH, camFPS)) {
+                    if (openCapture(cap, next, camW, camH, camFPS, nullptr, false)) {
                         camIndex = next;
                     #ifdef __linux__
                         std::cerr << "Switched to [" << camIndex << "] " << v4l2NameFor(camIndex) << "\n";
@@ -1641,7 +1954,7 @@ int main(int argc, char** argv) {
                     if (it == avail.begin() || it == avail.end()) it = avail.end();
                     --it;
                     int prev = *it;
-                    if (openCapture(cap, prev, camW, camH, camFPS)) {
+                    if (openCapture(cap, prev, camW, camH, camFPS, nullptr, false)) {
                         camIndex = prev;
                     #ifdef __linux__
                         std::cerr << "Switched to [" << camIndex << "] " << v4l2NameFor(camIndex) << "\n";
@@ -1653,7 +1966,7 @@ int main(int argc, char** argv) {
             }
             if (k >= '0' && k <= '9') {          // direct select 0..9
                 int idx = k - '0';
-                if (openCapture(cap, idx, camW, camH, camFPS)) {
+                if (openCapture(cap, idx, camW, camH, camFPS, nullptr, false)) {
                     camIndex = idx;
                 #ifdef __linux__
                     std::cerr << "Switched to [" << camIndex << "] " << v4l2NameFor(camIndex) << "\n";

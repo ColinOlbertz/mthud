@@ -15,8 +15,8 @@
         "strategy": "set"
       },
       "cacheVariables": {
-        "CMAKE_TOOLCHAIN_FILE": "C:/vcpkg/scripts/buildsystems/vcpkg.cmake",
-        "VCPKG_INSTALLED_DIR": "C:/vcpkg/installed",
+        "CMAKE_TOOLCHAIN_FILE": "C:/dev/vcpkg/scripts/buildsystems/vcpkg.cmake",
+        "VCPKG_INSTALLED_DIR": "C:/dev/vcpkg/installed",
         "CMAKE_BUILD_TYPE": "Release"
       }
     }

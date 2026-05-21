@@ -67,6 +67,10 @@ if(UNIX AND NOT APPLE)
   target_link_libraries(mthud PRIVATE OpenGL::GL dl)
 endif()
 
+if(WIN32)
+  target_link_libraries(mthud PRIVATE mf mfplat mfuuid ole32)
+endif()
+
 # ---- Xsens MT SDK ----------------------------------------------------------
 if(USE_XSENS)
   target_compile_definitions(mthud PRIVATE USE_XSENS=1)
