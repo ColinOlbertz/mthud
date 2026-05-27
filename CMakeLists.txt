@@ -33,6 +33,7 @@ set(MTHUD_SOURCES
 )
 
 add_executable(mthud ${MTHUD_SOURCES})
+add_executable(calibrate_bt35e_intrinsics src/tools/calibrate_bt35e_intrinsics.cpp)
 
 # String macro used by your code
 target_compile_definitions(mthud PRIVATE PROJECT_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
@@ -40,12 +41,17 @@ target_compile_definitions(mthud PRIVATE PROJECT_SOURCE_DIR="${CMAKE_SOURCE_DIR}
 # Warnings
 if(MSVC)
   target_compile_options(mthud PRIVATE /W4 /permissive-)
+  target_compile_options(calibrate_bt35e_intrinsics PRIVATE /W4 /permissive-)
 else()
   target_compile_options(mthud PRIVATE -Wall -Wextra -Wpedantic)
+  target_compile_options(calibrate_bt35e_intrinsics PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
 # Base include paths
 target_include_directories(mthud PRIVATE
+  ${OpenCV_INCLUDE_DIRS}
+)
+target_include_directories(calibrate_bt35e_intrinsics PRIVATE
   ${OpenCV_INCLUDE_DIRS}
 )
 
@@ -58,6 +64,9 @@ target_link_libraries(mthud PRIVATE
   nlohmann_json::nlohmann_json
   Threads::Threads
 )
+target_link_libraries(calibrate_bt35e_intrinsics PRIVATE
+  ${OpenCV_LIBS}
+)
 
 if(spdlog_FOUND)
   target_link_libraries(mthud PRIVATE spdlog::spdlog_header_only)
@@ -69,6 +78,7 @@ endif()
 
 if(WIN32)
   target_link_libraries(mthud PRIVATE mf mfplat mfuuid ole32)
+  target_link_libraries(calibrate_bt35e_intrinsics PRIVATE mf mfplat mfuuid ole32)
 endif()
 
 # ---- Xsens MT SDK ----------------------------------------------------------
@@ -213,6 +223,10 @@ if(EXISTS "${_opencv_bin_dir}")
       COMMAND ${CMAKE_COMMAND} -E copy_if_different
               ${_opencv_runtime_dlls}
               "$<TARGET_FILE_DIR:mthud>/")
+    add_custom_command(TARGET calibrate_bt35e_intrinsics POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+              ${_opencv_runtime_dlls}
+              "$<TARGET_FILE_DIR:calibrate_bt35e_intrinsics>/")
   endif()
 endif()
 

@@ -246,6 +246,12 @@ static std::optional<int> mfCameraIndexByName(const std::string& nameNeedle) {
     if (didCoInit) CoUninitialize();
     return found;
 }
+
+static std::optional<std::string> preferredCameraName() {
+    if (auto name = getEnvString("CAM_NAME"); name && !name->empty()) return *name;
+    if (mfCameraIndexByName("BT-35E")) return std::string("BT-35E");
+    return std::nullopt;
+}
 #endif
 
 static std::vector<int> scanCameras(int maxIdx = 12) {
@@ -310,7 +316,7 @@ static bool openCapture(cv::VideoCapture& cap, int index,
 
 #if defined(_WIN32)
     if (honorNamedSource) {
-        if (auto name = getEnvString("CAM_NAME"); name && !name->empty()) {
+        if (auto name = preferredCameraName(); name && !name->empty()) {
             if (auto mfIdx = mfCameraIndexByName(*name)) {
                 std::cerr << "Resolved camera name \"" << *name << "\" to Media Foundation index " << *mfIdx << "\n";
                 for (int backend : backends) {
@@ -582,6 +588,7 @@ struct GpuComposite {
 // ---------- Shared state between render thread (main) and UI thread ----------
 
 static std::atomic<bool> g_running{true};
+static std::atomic<int>  g_cameraCommand{0};
 static std::mutex        g_camMutex;
 static cv::Mat           g_camPreview;  // last composited camera+HUD frame shown in UI thread
 
@@ -653,6 +660,8 @@ static FrameClock g_clk;
 
 // Trackbars can’t be negative; map [0..MAX] -> [-HALF..+HALF]
 static inline int centered(int v, int max) { return v - max/2; }
+static constexpr int OFFSET_SLIDER_MAX = 2000;
+static constexpr double HUD_OFFSET_SLIDER_GAIN = 4.0; // 0..2000 slider => +/-4000 px
 
 static void buildSRT_px(float SRT_out[9],
                         int TB_off_x_px, int TB_off_y_px,
@@ -660,9 +669,9 @@ static void buildSRT_px(float SRT_out[9],
                         int TB_pivot_tl,  // 1=top-left, 0=center
                         int hudW, int hudH)
 {
-    // offsets in pixels: 0..2000 -> [-1000..+1000]
-    const double dx = (double)centered(TB_off_x_px, 2000);
-    const double dy = (double)centered(TB_off_y_px, 2000);
+    // offsets in pixels: 0..2000 -> [-4000..+4000] after gain
+    const double dx = (double)centered(TB_off_x_px, OFFSET_SLIDER_MAX) * HUD_OFFSET_SLIDER_GAIN;
+    const double dy = (double)centered(TB_off_y_px, OFFSET_SLIDER_MAX) * HUD_OFFSET_SLIDER_GAIN;
 
     // scale: 1..400 % -> 0.01..4.00
     const double s  = std::max(0.01, TB_scale_pct / 100.0);
@@ -903,6 +912,7 @@ static Viewport letterbox(int fbw, int fbh, int srcw, int srch) {
 //static const char* WIN_CTRL = "HUD Controls"; 
 static const fs::path BASE_DIR = fs::path(PROJECT_SOURCE_DIR);
 static const fs::path PERSIST = configPath("hud_layout_controls.json");
+static const fs::path VIEW_ALIGN_PATH = configPath("view_alignment.json");
 
 // HUD placement controls
 static int TB_pitch_scale_x1000 = 20;   // manual NDC/deg *1000
@@ -924,16 +934,19 @@ static int  TB_probe_dY_canvas     = 100; // px
 
 // Display / view calibration
 static int  TB_view_hfov_deg       = 23;  // deg; 0 = use camera intrinsics
+static bool g_view_center_calibrated = false;
+static double g_view_ray_x = 0.0; // normalized camera ray x/z for display center
+static double g_view_ray_y = 0.0; // normalized camera ray y/z for display center
 
 // ---- Goggles overlay controls (2D SRT applied after HUD warping) ----
 static int TB_gog_show_markers = 1;   // 0/1: draw detected markers in goggles
 static int TB_gog_show_axes    = 1;   // 0/1: draw axes in goggles
-static int TB_gog_off_x_px     = 1000; // image-space offset for goggles overlay (centered)
+static int TB_gog_off_x_px     = 1000; // image-space offset slider for goggles overlay (centered)
 static int TB_gog_off_y_px     = 1000;
 
-// Offsets in pixels mapped from 0..2000 => -1000..+1000
-static int TB_ov_off_x_px = 1000;     // centered() => -1000..+1000
-static int TB_ov_off_y_px = 1000;     // centered() => -1000..+1000
+// Offset sliders use HUD_OFFSET_SLIDER_GAIN, so 0..2000 currently maps to +/-4000 px
+static int TB_ov_off_x_px = 1000;
+static int TB_ov_off_y_px = 1000;
 // Zoom range 1..400 % (allows much smaller than before)
 static int TB_ov_scale_pct = 100;     // 1..400
 // Rotation around pivot, 0..360 -> -180..+180
@@ -1022,6 +1035,42 @@ static void load_controls() {
         TB_pitch_trim_x1000 = j["pitch_ndc_x1000"].get<int>();
 }
 
+static void applyViewCenterCalibration(cv::Mat& K, const cv::Size& size) {
+    if (!g_view_center_calibrated || K.empty()) return;
+    K.at<double>(0, 2) = 0.5 * double(size.width)  - K.at<double>(0, 0) * g_view_ray_x;
+    K.at<double>(1, 2) = 0.5 * double(size.height) - K.at<double>(1, 1) * g_view_ray_y;
+}
+
+static bool loadViewAlignment() {
+    if (!fs::exists(VIEW_ALIGN_PATH)) return false;
+    try {
+        std::ifstream f(VIEW_ALIGN_PATH);
+        if (!f) return false;
+        json j; f >> j;
+        if (!j.contains("view_ray_x") || !j.contains("view_ray_y")) return false;
+        g_view_ray_x = j["view_ray_x"].get<double>();
+        g_view_ray_y = j["view_ray_y"].get<double>();
+        g_view_center_calibrated = std::isfinite(g_view_ray_x) && std::isfinite(g_view_ray_y);
+        if (g_view_center_calibrated) {
+            std::cerr << "Loaded view alignment: ray=(" << g_view_ray_x << ", " << g_view_ray_y << ")\n";
+        }
+        return g_view_center_calibrated;
+    } catch (...) {
+        return false;
+    }
+}
+
+static void saveViewAlignment(size_t sampleCount) {
+    json j{
+        {"view_ray_x", g_view_ray_x},
+        {"view_ray_y", g_view_ray_y},
+        {"samples", int(sampleCount)},
+        {"note", "Display-center ray in BT-35E camera-normalized coordinates"}
+    };
+    std::ofstream(VIEW_ALIGN_PATH) << j.dump(2);
+    std::cerr << "Saved view alignment to " << VIEW_ALIGN_PATH << "\n";
+}
+
 // ---------- helpers ----------
 // ---------- UI: split controls into 2 windows ----------
 
@@ -1106,6 +1155,16 @@ static void uiThreadFunc(cv::Size imgSize)
 
         // process UI events, keep it short to reduce latency
         int key = cv::waitKey(1);
+        if (key >= 0) {
+            key &= 0xff;
+            if (key == 'l' || key == 'L' || key == 'n' || key == 'N' ||
+                key == 'p' || key == 'P' || key == 'v' || key == 'V' ||
+                key == 'a' || key == 'A' || key == 't' || key == 'T' ||
+                key == 'r' || key == 'R' || key == 'm' || key == 'M' ||
+                (key >= '0' && key <= '9')) {
+                g_cameraCommand.store(std::tolower(key));
+            }
+        }
         if (key == 27) { // ESC in UI also stops everything
             g_running = false;
         }
@@ -1126,8 +1185,10 @@ static bool loadCalibrationJSON(const std::string& path, cv::Mat& K, cv::Mat& D,
                 auto v = j["camera_matrix"].get<std::vector<double>>();
                 if (v.size() == 9) K = cv::Mat(v, true).reshape(1, 3);
             }
-            if (j.contains("distortion_coefficients")) {
-                auto v = j["distortion_coefficients"].get<std::vector<double>>();
+            const char* distKey = j.contains("distortion_coefficients") ? "distortion_coefficients" :
+                                  (j.contains("dist_coeffs") ? "dist_coeffs" : nullptr);
+            if (distKey) {
+                auto v = j[distKey].get<std::vector<double>>();
                 if (!v.empty()) D = cv::Mat(v, true).reshape(1, 1);
             }
             if (j.contains("image_width") && j.contains("image_height")) {
@@ -1148,6 +1209,7 @@ static bool loadCalibrationJSON(const std::string& path, cv::Mat& K, cv::Mat& D,
                 cv::Mat camMat, dist;
                 fs["camera_matrix"] >> camMat;
                 fs["distortion_coefficients"] >> dist;
+                if (dist.empty()) fs["dist_coeffs"] >> dist;
                 if (!camMat.empty() && camMat.total() == 9) {
                     camMat = camMat.reshape(1, 3);
                     K = camMat.clone();
@@ -1177,6 +1239,30 @@ static void buildBillboardPts4x3(const cv::Point3f& origin_TR, float width_m, st
     out[1] = { origin_TR.x - w, origin_TR.y,     origin_TR.z + depth }; // TL
     out[2] = { origin_TR.x - w, origin_TR.y - h, origin_TR.z + depth }; // BL
     out[3] = { origin_TR.x,     origin_TR.y - h, origin_TR.z + depth }; // BR
+}
+
+struct AlignTarget {
+    std::string label;
+    cv::Point3f obj;
+};
+
+static std::vector<AlignTarget> makeAlignmentTargets(int mx, int my, float markerLen, float gap) {
+    std::vector<AlignTarget> targets;
+    auto addCorner = [&](int id, const char* corner, float x, float y) {
+        targets.push_back({ "marker " + std::to_string(id) + " " + corner, {x, y, 0.0f} });
+    };
+    for (int row = 0; row < my; ++row) {
+        for (int col = 0; col < mx; ++col) {
+            int id = row * mx + col;
+            float x0 = col * (markerLen + gap);
+            float y0 = row * (markerLen + gap);
+            addCorner(id, "TL", x0, y0);
+            addCorner(id, "TR", x0 + markerLen, y0);
+            addCorner(id, "BR", x0 + markerLen, y0 + markerLen);
+            addCorner(id, "BL", x0, y0 + markerLen);
+        }
+    }
+    return targets;
 }
 
 // apply homography (64F)
@@ -1221,11 +1307,14 @@ static bool canvasPxPerDegree_fromIntrinsics(const cv::Mat& Hh64,
 }
 
 static GLFWwindow* createOverlayWindow(GLFWwindow* shareWith, int desiredMonitor = -1,
-                                       bool transparent = true, bool borderless = true) {
+                                       bool transparent = true, bool borderless = true,
+                                       bool exclusiveFullscreen = false) {
     glfwWindowHint(GLFW_TRANSPARENT_FRAMEBUFFER, transparent ? GLFW_TRUE : GLFW_FALSE);
     glfwWindowHint(GLFW_DECORATED, borderless ? GLFW_FALSE : GLFW_TRUE);
-    glfwWindowHint(GLFW_FLOATING, GLFW_TRUE);
+    glfwWindowHint(GLFW_FLOATING, envFlag("HUD_ALWAYS_ON_TOP", false) ? GLFW_TRUE : GLFW_FALSE);
     glfwWindowHint(GLFW_AUTO_ICONIFY, GLFW_FALSE);
+    glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
+    glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
 
     int monitorCount = 0;
     GLFWmonitor** mons = glfwGetMonitors(&monitorCount);
@@ -1245,11 +1334,20 @@ static GLFWwindow* createOverlayWindow(GLFWwindow* shareWith, int desiredMonitor
     int W = mode ? mode->width : 2560;
     int H = mode ? mode->height : 1920;
 
-    GLFWwindow* w = glfwCreateWindow(W, H, "HUD Overlay", target, shareWith);
+    GLFWwindow* w = glfwCreateWindow(W, H, "HUD Overlay",
+                                     exclusiveFullscreen ? target : nullptr,
+                                     shareWith);
     if (!w) return nullptr;
 
+    if (!exclusiveFullscreen && target) {
+        int mx = 0, my = 0;
+        glfwGetMonitorPos(target, &mx, &my);
+        glfwSetWindowPos(w, mx, my);
+    }
+    glfwShowWindow(w);
+
     glfwMakeContextCurrent(w);
-    glfwSwapInterval(0);       // vsync on the glasses
+    glfwSwapInterval(0);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
@@ -1415,19 +1513,28 @@ int main(int argc, char** argv) {
         double v = std::atof(e->c_str());
         if (v > 0.0 && v < 180.0) cam_fallback_hfov_deg = v;
     }
-    const std::string calibPath = configPath("calibration.json").string();
+    std::string defaultCalibPath = configPath("bt35e_intrinsics.json").string();
+    if (!fs::exists(defaultCalibPath)) {
+        defaultCalibPath = configPath("calibration.json").string();
+    }
+    const std::string calibPath = getEnvString("CAM_CALIB").value_or(defaultCalibPath);
     if (!loadCalibrationJSON(calibPath, K_cam, D_cam, imgSize)) {
         approxFOVIntrinsics(imgSize, cam_fallback_hfov_deg, K_cam, D_cam);
-        std::cout << "No calibration.json. Using FOV approximation (" << cam_fallback_hfov_deg << " deg hfov).\n";
+        std::cout << "No usable camera calibration at " << calibPath
+                  << ". Using FOV approximation (" << cam_fallback_hfov_deg << " deg hfov).\n";
+    } else {
+        std::cout << "Loaded camera calibration: " << calibPath << "\n";
     }
     // Ensure 64F
     K_cam.convertTo(K_cam, CV_64F); D_cam.convertTo(D_cam, CV_64F);
 
     // Separate intrinsics for how the HUD is rendered in the glasses.
     cv::Mat K_view = K_cam.clone(), D_view = D_cam.clone();
+    loadViewAlignment();
     auto refreshViewIntrinsics = [&](int hfov_deg) {
         if (hfov_deg > 0) approxFOVIntrinsics(imgSize, double(hfov_deg), K_view, D_view);
         else { K_view = K_cam.clone(); D_view = D_cam.clone(); }
+        applyViewCenterCalibration(K_view, imgSize);
     };
     refreshViewIntrinsics(TB_view_hfov_deg);
     int prev_view_hfov_deg = TB_view_hfov_deg;
@@ -1520,9 +1627,12 @@ int main(int argc, char** argv) {
         }
         GLFWmonitor** mons = glfwGetMonitors(&mc);
         const char* monName = (mons && idx >= 0 && idx < mc) ? glfwGetMonitorName(mons[idx]) : nullptr;
+        const bool fullscreenOverlay = envFlag("HUD_FULLSCREEN", false);
         std::cerr << "Creating overlay on Monitor[" << idx << "]"
-                  << (monName ? " " : "") << (monName ? monName : "") << "\n";
-        hudOverlay = createOverlayWindow(win, idx, /*transparent*/false, /*borderless*/true);
+                  << (monName ? " " : "") << (monName ? monName : "")
+                  << (fullscreenOverlay ? " fullscreen" : " borderless-windowed") << "\n";
+        hudOverlay = createOverlayWindow(win, idx, /*transparent*/false, /*borderless*/true,
+                                         fullscreenOverlay);
         if (!hudOverlay) {
             std::cerr << "createOverlayWindow failed\n";
             currentOverlayIdx = -1;
@@ -1558,20 +1668,190 @@ int main(int argc, char** argv) {
             std::cerr << "\n";
         }
     };
+    auto chooseOverlayMonitor = [&]() {
+        int mc = 0;
+        GLFWmonitor** mons = glfwGetMonitors(&mc);
+        if (mc <= 0 || !mons) return -1;
+        if (auto index = getEnvString("HUD_MONITOR"); index && !index->empty()) {
+            return envIntAny("HUD_MONITOR", 0);
+        }
+
+        auto lower = [](std::string value) {
+            std::transform(value.begin(), value.end(), value.begin(),
+                           [](unsigned char c) { return char(std::tolower(c)); });
+            return value;
+        };
+        if (auto requestedName = getEnvString("HUD_MONITOR_NAME"); requestedName && !requestedName->empty()) {
+            const std::string needle = lower(*requestedName);
+            for (int i = 0; i < mc; ++i) {
+                const char* name = glfwGetMonitorName(mons[i]);
+                if (name && lower(name).find(needle) != std::string::npos) return i;
+            }
+        }
+
+        const char* preferredNames[] = { "EPSON", "bt-35", "hmd", "ESPON HMD"};
+        for (const char* needle : preferredNames) {
+            for (int i = 0; i < mc; ++i) {
+                const char* name = glfwGetMonitorName(mons[i]);
+                if (name && lower(name).find(needle) != std::string::npos) return i;
+            }
+        }
+
+        GLFWmonitor* primary = glfwGetPrimaryMonitor();
+        for (int i = 0; i < mc; ++i) {
+            if (mons[i] != primary) return i;
+        }
+        return 0;
+    };
 
     if (envFlag("HUD_OVERLAY", true)) {
-        int mc = 0; glfwGetMonitors(&mc);
         logMonitors();
-        const int requestedMonitor = envIntAny("HUD_MONITOR", mc > 1 ? 1 : 0);
+        const int requestedMonitor = chooseOverlayMonitor();
         recreateOverlayAt(requestedMonitor);
     } else {
         std::cerr << "HUD overlay disabled by HUD_OVERLAY=0.\n";
     }
+    auto cycleOverlay = [&]() {
+        int mc = 0;
+        glfwGetMonitors(&mc);
+        if (mc <= 0) return;
+        int next = (currentOverlayIdx < 0) ? 0 : (currentOverlayIdx + 1) % mc;
+        std::cerr << "Cycling overlay to Monitor[" << next << "]\n";
+        recreateOverlayAt(next);
+    };
 
     // --- smoothing state
     double spd_kt_smooth = 0.0, alt_ft_smooth = 0.0;
     bool   first_samples = true;
     bool   sensor_was_ok = false;
+    bool   alignMode = false;
+    int    alignTargetIdx = 0;
+    std::vector<cv::Point2d> alignRaySamples;
+    std::vector<AlignTarget> alignTargets = makeAlignmentTargets(MX, MY, MARKER_LEN, GAP);
+    auto handleCameraCommand = [&](int k) {
+        if (k == 0) return;
+        if (k == 'm') {
+            cycleOverlay();
+        } else if (k == 'l') {
+            auto avail = scanCameras(12);
+            std::cerr << "Cameras found:";
+            if (avail.empty()) std::cerr << " none\n";
+            else {
+                std::cerr << "\n";
+                for (int idx : avail) {
+                #ifdef __linux__
+                    std::cerr << "  [" << idx << "] " << v4l2NameFor(idx) << "\n";
+                #else
+                    std::cerr << "  [" << idx << "]" << (idx == camIndex ? " active" : "") << "\n";
+                #endif
+                }
+            }
+        } else if (k == 'n') {
+            auto avail = scanCameras(12);
+            if (!avail.empty()) {
+                auto it = std::find(avail.begin(), avail.end(), camIndex);
+                if (it == avail.end() || ++it == avail.end()) it = avail.begin();
+                int next = *it;
+                if (openCapture(cap, next, camW, camH, camFPS, nullptr, false)) {
+                    camIndex = next;
+                    cameraAvailable = true;
+                #ifdef __linux__
+                    std::cerr << "Switched to [" << camIndex << "] " << v4l2NameFor(camIndex) << "\n";
+                #else
+                    std::cerr << "Switched to [" << camIndex << "]\n";
+                #endif
+                }
+            }
+        } else if (k == 'p') {
+            auto avail = scanCameras(12);
+            if (!avail.empty()) {
+                auto it = std::find(avail.begin(), avail.end(), camIndex);
+                if (it == avail.begin() || it == avail.end()) it = avail.end();
+                --it;
+                int prev = *it;
+                if (openCapture(cap, prev, camW, camH, camFPS, nullptr, false)) {
+                    camIndex = prev;
+                    cameraAvailable = true;
+                #ifdef __linux__
+                    std::cerr << "Switched to [" << camIndex << "] " << v4l2NameFor(camIndex) << "\n";
+                #else
+                    std::cerr << "Switched to [" << camIndex << "]\n";
+                #endif
+                }
+            }
+        } else if (k >= '0' && k <= '9') {
+            int idx = k - '0';
+            if (openCapture(cap, idx, camW, camH, camFPS, nullptr, false)) {
+                camIndex = idx;
+                cameraAvailable = true;
+            #ifdef __linux__
+                std::cerr << "Switched to [" << camIndex << "] " << v4l2NameFor(camIndex) << "\n";
+            #else
+                std::cerr << "Switched to [" << camIndex << "]\n";
+            #endif
+            } else {
+                std::cerr << "Failed to open camera " << idx << "\n";
+            }
+        }
+    };
+    auto handleAlignCommand = [&](int k, const BoardPose& pose) {
+        if (k == 0) return;
+        if (k == 'v') {
+            alignMode = !alignMode;
+            std::cerr << "View alignment mode " << (alignMode ? "ON" : "OFF") << "\n";
+            if (alignMode && !alignTargets.empty()) {
+                std::cerr << "Target: " << alignTargets[alignTargetIdx].label
+                          << " | A=capture, T=next target, R=reset samples\n";
+            }
+        } else if (k == 't') {
+            if (!alignTargets.empty()) {
+                alignTargetIdx = (alignTargetIdx + 1) % int(alignTargets.size());
+                std::cerr << "Alignment target: " << alignTargets[alignTargetIdx].label << "\n";
+            }
+        } else if (k == 'r') {
+            alignRaySamples.clear();
+            g_view_center_calibrated = false;
+            g_view_ray_x = g_view_ray_y = 0.0;
+            refreshViewIntrinsics(TB_view_hfov_deg);
+            std::cerr << "Reset view alignment samples.\n";
+        } else if (k == 'a') {
+            if (!alignMode) {
+                std::cerr << "Press V first to enter view alignment mode.\n";
+                return;
+            }
+            if (!pose.valid || alignTargets.empty()) {
+                std::cerr << "No valid ArUco pose; cannot capture alignment sample.\n";
+                return;
+            }
+            cv::Mat R;
+            cv::Rodrigues(pose.rvec, R);
+            const cv::Point3f& p = alignTargets[alignTargetIdx].obj;
+            cv::Mat X = R * (cv::Mat_<double>(3, 1) << p.x, p.y, p.z) + pose.tvec;
+            const double z = X.at<double>(2);
+            if (!std::isfinite(z) || std::abs(z) < 1e-6) {
+                std::cerr << "Bad target depth; sample skipped.\n";
+                return;
+            }
+            const double rx = X.at<double>(0) / z;
+            const double ry = X.at<double>(1) / z;
+            alignRaySamples.emplace_back(rx, ry);
+
+            double sx = 0.0, sy = 0.0;
+            for (const auto& s : alignRaySamples) { sx += s.x; sy += s.y; }
+            g_view_ray_x = sx / double(alignRaySamples.size());
+            g_view_ray_y = sy / double(alignRaySamples.size());
+            g_view_center_calibrated = true;
+            refreshViewIntrinsics(TB_view_hfov_deg);
+            saveViewAlignment(alignRaySamples.size());
+
+            std::cerr << "Captured " << alignTargets[alignTargetIdx].label
+                      << " sample #" << alignRaySamples.size()
+                      << " ray=(" << rx << ", " << ry << ")"
+                      << " avg=(" << g_view_ray_x << ", " << g_view_ray_y << ")\n";
+            alignTargetIdx = (alignTargetIdx + 1) % int(alignTargets.size());
+            std::cerr << "Next target: " << alignTargets[alignTargetIdx].label << "\n";
+        }
+    };
 
     while (g_running) {
         g_clk.begin();
@@ -1719,6 +1999,25 @@ int main(int argc, char** argv) {
             lineAA(0, 2, { 0,255,  0 }); // Y green
             lineAA(0, 3, { 255,  0,  0 }); // Z blue
         }
+        if (alignMode) {
+            const cv::Point center(camera.cols / 2, camera.rows / 2);
+            cv::line(camera, {center.x - 24, center.y}, {center.x + 24, center.y}, {0,255,255}, 2, cv::LINE_AA);
+            cv::line(camera, {center.x, center.y - 24}, {center.x, center.y + 24}, {0,255,255}, 2, cv::LINE_AA);
+            std::string targetText = alignTargets.empty() ? "no targets" : alignTargets[alignTargetIdx].label;
+            cv::putText(camera, "VIEW ALIGN: A capture, T next, R reset, V exit", {10, camera.rows - 54},
+                        cv::FONT_HERSHEY_SIMPLEX, 0.65, {0,255,255}, 2, cv::LINE_AA);
+            cv::putText(camera, "Target: " + targetText + "  samples=" + std::to_string(alignRaySamples.size()),
+                        {10, camera.rows - 24}, cv::FONT_HERSHEY_SIMPLEX, 0.65, {0,255,255}, 2, cv::LINE_AA);
+            if (pose.valid && !alignTargets.empty()) {
+                std::vector<cv::Point3f> targetObj{ alignTargets[alignTargetIdx].obj };
+                std::vector<cv::Point2f> targetImg;
+                cv::projectPoints(targetObj, pose.rvec, pose.tvec, K_cam, D_cam, targetImg);
+                if (!targetImg.empty()) {
+                    cv::drawMarker(camera, targetImg[0], {255,0,255}, cv::MARKER_CROSS, 34, 3, cv::LINE_AA);
+                    cv::circle(camera, targetImg[0], 16, {255,0,255}, 2, cv::LINE_AA);
+                }
+            }
+        }
 
         // Pre-build ArUco overlays for the glasses (image space)
         std::vector<float> gogMarkerLines, gogAxisX, gogAxisY, gogAxisZ;
@@ -1763,8 +2062,8 @@ int main(int argc, char** argv) {
         }
         // Apply manual eye-offset compensation for goggles overlay (image space)
         if (!gogMarkerLines.empty() || !gogAxisX.empty() || !gogAxisY.empty() || !gogAxisZ.empty()) {
-            const float dx = float(centered(TB_gog_off_x_px, 2000));
-            const float dy = float(centered(TB_gog_off_y_px, 2000));
+            const float dx = float(centered(TB_gog_off_x_px, OFFSET_SLIDER_MAX) * HUD_OFFSET_SLIDER_GAIN);
+            const float dy = float(centered(TB_gog_off_y_px, OFFSET_SLIDER_MAX) * HUD_OFFSET_SLIDER_GAIN);
             auto applyOffset = [&](std::vector<float>& v) {
                 for (size_t i = 0; i + 1 < v.size(); i += 2) {
                     v[i]     += dx;
@@ -1884,19 +2183,47 @@ int main(int argc, char** argv) {
         // --- OFFSCREEN PASS: draw HUD into FBO
         glfwMakeContextCurrent(win); glfwPollEvents();
 
-        // Cycle overlay across monitors with F9
+        auto keyPressedInGlfwWindow = [&](int key) {
+            return glfwGetKey(win, key) == GLFW_PRESS ||
+                   (hudOverlay && glfwGetKey(hudOverlay, key) == GLFW_PRESS);
+        };
+
+        // Cycle overlay across monitors with F9, whichever HUD window has focus
         static bool f9Latch = false;
-        int f9 = glfwGetKey(win, GLFW_KEY_F9);
+        int f9 = keyPressedInGlfwWindow(GLFW_KEY_F9) ? GLFW_PRESS : GLFW_RELEASE;
         if (f9 == GLFW_PRESS && !f9Latch) {
-            int mc = 0; glfwGetMonitors(&mc);
-            if (mc > 0) {
-                int next = (currentOverlayIdx < 0) ? 0 : (currentOverlayIdx + 1) % mc;
-                std::cerr << "Cycling overlay to Monitor[" << next << "]\n";
-                recreateOverlayAt(next);
-            }
+            cycleOverlay();
             f9Latch = true;
         }
         if (f9 == GLFW_RELEASE) f9Latch = false;
+
+        int command = g_cameraCommand.exchange(0);
+        static int glfwCameraKeyLatch = 0;
+        int glfwCommand = 0;
+        if (keyPressedInGlfwWindow(GLFW_KEY_M)) glfwCommand = 'm';
+        else if (keyPressedInGlfwWindow(GLFW_KEY_L)) glfwCommand = 'l';
+        else if (keyPressedInGlfwWindow(GLFW_KEY_N)) glfwCommand = 'n';
+        else if (keyPressedInGlfwWindow(GLFW_KEY_P)) glfwCommand = 'p';
+        else if (keyPressedInGlfwWindow(GLFW_KEY_V)) glfwCommand = 'v';
+        else if (keyPressedInGlfwWindow(GLFW_KEY_A)) glfwCommand = 'a';
+        else if (keyPressedInGlfwWindow(GLFW_KEY_T)) glfwCommand = 't';
+        else if (keyPressedInGlfwWindow(GLFW_KEY_R)) glfwCommand = 'r';
+        else {
+            for (int digit = 0; digit <= 9; ++digit) {
+                if (keyPressedInGlfwWindow(GLFW_KEY_0 + digit)) {
+                    glfwCommand = '0' + digit;
+                    break;
+                }
+            }
+        }
+        if (glfwCommand != 0 && glfwCameraKeyLatch != glfwCommand) {
+            command = glfwCommand;
+            glfwCameraKeyLatch = glfwCommand;
+        } else if (glfwCommand == 0) {
+            glfwCameraKeyLatch = 0;
+        }
+        handleCameraCommand(command);
+        handleAlignCommand(command, pose);
 
         glBindFramebuffer(GL_FRAMEBUFFER, hudFBO);
         glActiveTexture(GL_TEXTURE0);
@@ -1909,75 +2236,6 @@ int main(int argc, char** argv) {
         g_clk.stamp_hud_done();
 
         // GPU composite window removed; camera preview stays in the OpenCV UI
-
-        if (uiAvailable) {
-            // ---- Show camera preview (with composite)
-            // cv::imshow("camera", camera);
-            int k = cv::waitKey(1);
-            if (k == 27) break;
-
-            if (k == 'l') {                      // list cameras
-                auto avail = scanCameras(12);
-                std::cerr << "Cameras found:";
-                if (avail.empty()) std::cerr << " none\n";
-                else {
-                    std::cerr << "\n";
-                    for (int idx : avail) {
-                    #ifdef __linux__
-                        std::cerr << "  [" << idx << "] " << v4l2NameFor(idx) << "\n";
-                    #else
-                        std::cerr << "  [" << idx << "]\n";
-                    #endif
-                    }
-                }
-            }
-            if (k == 'n') {                      // next camera
-                auto avail = scanCameras(12);
-                if (!avail.empty()) {
-                    auto it = std::find(avail.begin(), avail.end(), camIndex);
-                    if (it == avail.end() || ++it == avail.end()) it = avail.begin();
-                    int next = *it;
-                    if (openCapture(cap, next, camW, camH, camFPS, nullptr, false)) {
-                        camIndex = next;
-                    #ifdef __linux__
-                        std::cerr << "Switched to [" << camIndex << "] " << v4l2NameFor(camIndex) << "\n";
-                    #else
-                        std::cerr << "Switched to [" << camIndex << "]\n";
-                    #endif
-                    }
-                }
-            }
-            if (k == 'p') {                      // prev camera
-                auto avail = scanCameras(12);
-                if (!avail.empty()) {
-                    auto it = std::find(avail.begin(), avail.end(), camIndex);
-                    if (it == avail.begin() || it == avail.end()) it = avail.end();
-                    --it;
-                    int prev = *it;
-                    if (openCapture(cap, prev, camW, camH, camFPS, nullptr, false)) {
-                        camIndex = prev;
-                    #ifdef __linux__
-                        std::cerr << "Switched to [" << camIndex << "] " << v4l2NameFor(camIndex) << "\n";
-                    #else
-                        std::cerr << "Switched to [" << camIndex << "]\n";
-                    #endif
-                    }
-                }
-            }
-            if (k >= '0' && k <= '9') {          // direct select 0..9
-                int idx = k - '0';
-                if (openCapture(cap, idx, camW, camH, camFPS, nullptr, false)) {
-                    camIndex = idx;
-                #ifdef __linux__
-                    std::cerr << "Switched to [" << camIndex << "] " << v4l2NameFor(camIndex) << "\n";
-                #else
-                    std::cerr << "Switched to [" << camIndex << "]\n";
-                #endif
-                } else {
-                    std::cerr << "Failed to open camera " << idx << "\n";
-                }
-            }
-        }
 
         // ---- Draw goggles (textured quad of hudWarpTex, letterboxed to camera aspect)
         if (hudOverlay){
@@ -2017,6 +2275,16 @@ int main(int argc, char** argv) {
 
             // Optional ArUco overlays in the glasses (image space)
             if (lineOverlay.prog) {
+                if (alignMode) {
+                    const float cx = imgSize.width * 0.5f;
+                    const float cy = imgSize.height * 0.5f;
+                    const float r = std::min(imgSize.width, imgSize.height) * 0.035f;
+                    std::vector<float> centerCursor = {
+                        cx - r, cy, cx + r, cy,
+                        cx, cy - r, cx, cy + r
+                    };
+                    lineOverlay.draw(centerCursor, imgSize.width, imgSize.height, 1.0f, 1.0f, 0.0f, 0.95f, 3.0f);
+                }
                 if (!gogMarkerLines.empty())
                     lineOverlay.draw(gogMarkerLines, imgSize.width, imgSize.height, 0.1f, 1.0f, 0.1f, 0.9f, 2.0f);
                 if (!gogAxisX.empty())
