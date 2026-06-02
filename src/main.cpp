@@ -36,6 +36,7 @@
 
 #include "aruco_tracker.hpp"
 #include "hud_renderer.hpp"
+#include "moverio_sensor.hpp"
 #include "sensor.hpp"
 
 using nlohmann::json;
@@ -47,6 +48,83 @@ static const float HINV_ID[9] = { 1,0,0,  0,1,0,  0,0,1 };
 static double nowSeconds() {
     using clock = std::chrono::high_resolution_clock;
     return std::chrono::duration<double>(clock::now().time_since_epoch()).count();
+}
+
+static cv::Mat rotationFromQuaternion(const OrientationSample& q) {
+    const double xx = q.x * q.x, yy = q.y * q.y, zz = q.z * q.z;
+    const double xy = q.x * q.y, xz = q.x * q.z, yz = q.y * q.z;
+    const double wx = q.w * q.x, wy = q.w * q.y, wz = q.w * q.z;
+    return (cv::Mat_<double>(3, 3) <<
+        1.0 - 2.0 * (yy + zz), 2.0 * (xy - wz),       2.0 * (xz + wy),
+        2.0 * (xy + wz),       1.0 - 2.0 * (xx + zz), 2.0 * (yz - wx),
+        2.0 * (xz - wy),       2.0 * (yz + wx),       1.0 - 2.0 * (xx + yy));
+}
+
+static cv::Mat rotationFromEulerDegrees(const SensorSample& sample) {
+    const double roll = sample.bank_deg * CV_PI / 180.0;
+    const double pitch = sample.pitch_deg * CV_PI / 180.0;
+    const double yaw = sample.yaw_deg * CV_PI / 180.0;
+    const double cr = std::cos(roll), sr = std::sin(roll);
+    const double cp = std::cos(pitch), sp = std::sin(pitch);
+    const double cy = std::cos(yaw), sy = std::sin(yaw);
+    return (cv::Mat_<double>(3, 3) <<
+        cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr,
+        sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr,
+        -sp,     cp * sr,                cp * cr);
+}
+
+static BoardPose propagatePoseFromMoverio(const BoardPose& anchorPose,
+                                          const cv::Mat& anchorHeadRotation,
+                                          const cv::Mat& currentHeadRotation,
+                                          const cv::Mat& anchorXsensRotation,
+                                          const cv::Mat& currentXsensRotation,
+                                          bool xsensRelative,
+                                          int xsensRelativeMode,
+                                          bool mapMoverioToCameraAxes,
+                                          bool invertDelta,
+                                          const cv::Mat& pivotCamera) {
+    BoardPose predicted = anchorPose;
+    cv::Mat cameraDelta;
+    if (xsensRelative) {
+        cv::Mat anchorRelative;
+        cv::Mat currentRelative;
+        if ((xsensRelativeMode & 1) == 0) {
+            anchorRelative = anchorHeadRotation.t() * anchorXsensRotation;
+            currentRelative = currentHeadRotation.t() * currentXsensRotation;
+        }
+        else {
+            anchorRelative = anchorXsensRotation.t() * anchorHeadRotation;
+            currentRelative = currentXsensRotation.t() * currentHeadRotation;
+        }
+        cameraDelta = ((xsensRelativeMode & 2) == 0)
+            ? currentRelative * anchorRelative.t()
+            : currentRelative.t() * anchorRelative;
+    }
+    else {
+        cameraDelta = currentHeadRotation.t() * anchorHeadRotation;
+    }
+    if (mapMoverioToCameraAxes) {
+        // The resulting motion is expressed about Moverio's headset axes.
+        // Convert it only now to OpenCV camera axes.
+        const cv::Mat moverioToCamera = (cv::Mat_<double>(3, 3) <<
+            1.0,  0.0,  0.0,
+            0.0, -1.0,  0.0,
+            0.0,  0.0, -1.0);
+        cameraDelta = moverioToCamera.t() * cameraDelta * moverioToCamera;
+    }
+    if (invertDelta) cameraDelta = cameraDelta.t();
+
+    cv::Mat anchorBoardRotation;
+    cv::Rodrigues(anchorPose.rvec, anchorBoardRotation);
+    cv::Rodrigues(cameraDelta * anchorBoardRotation, predicted.rvec);
+    if (!pivotCamera.empty()) {
+        predicted.tvec = pivotCamera + cameraDelta * (anchorPose.tvec - pivotCamera);
+    }
+    else {
+        predicted.tvec = cameraDelta * anchorPose.tvec;
+    }
+    predicted.valid = true;
+    return predicted;
 }
 
 namespace fs = std::filesystem;
@@ -84,6 +162,109 @@ static bool envFlag(const char* key, bool fallback = false) {
     std::string s(*env);
     std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c){ return std::tolower(c); });
     return !(s == "0" || s == "false" || s == "off" || s == "no");
+}
+
+static int envIntValue(const char* key, int fallback) {
+    auto env = getEnvString(key);
+    if (!env || env->empty()) return fallback;
+    char* end = nullptr;
+    long value = std::strtol(env->c_str(), &end, 10);
+    if (end == env->c_str()) return fallback;
+    return int(value);
+}
+
+static bool sendMoverioDisplayDistance(int pixelShift) {
+    pixelShift = std::clamp(pixelShift, -32, 256);
+#ifdef _WIN32
+    static bool warnedMissingPort = false;
+    auto portEnv = getEnvString("MOVERIO_COM_PORT");
+    if (!portEnv || portEnv->empty()) portEnv = getEnvString("MOVERIO_DISPLAY_COM");
+    if (!portEnv || portEnv->empty()) portEnv = std::string("COM6");
+    if (!portEnv || portEnv->empty()) {
+        if (!warnedMissingPort) {
+            std::cerr << "Display distance slider active, but MOVERIO_COM_PORT is not set "
+                         "(example: set MOVERIO_COM_PORT=COM5)\n";
+            warnedMissingPort = true;
+        }
+        return false;
+    }
+
+    std::string port = *portEnv;
+    std::string devicePath = port.rfind("\\\\.\\", 0) == 0 ? port : "\\\\.\\" + port;
+    HANDLE h = CreateFileA(devicePath.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        std::cerr << "Failed to open Moverio display control port " << port
+                  << " for setdisplaydistance " << pixelShift
+                  << " (GetLastError=" << GetLastError() << ")\n";
+        return false;
+    }
+
+    DCB dcb{};
+    dcb.DCBlength = sizeof(dcb);
+    if (GetCommState(h, &dcb)) {
+        dcb.BaudRate = DWORD(std::clamp(envIntValue("MOVERIO_COM_BAUD", 9600), 1200, 921600));
+        dcb.ByteSize = 8;
+        dcb.Parity = NOPARITY;
+        dcb.StopBits = ONESTOPBIT;
+        SetCommState(h, &dcb);
+    }
+    COMMTIMEOUTS timeouts{};
+    timeouts.ReadIntervalTimeout = 20;
+    timeouts.ReadTotalTimeoutConstant = 100;
+    timeouts.ReadTotalTimeoutMultiplier = 1;
+    timeouts.WriteTotalTimeoutConstant = 100;
+    SetCommTimeouts(h, &timeouts);
+
+    auto writeCommand = [&](const std::string& command) -> bool {
+        DWORD written = 0;
+        const BOOL ok = WriteFile(h, command.data(), DWORD(command.size()), &written, nullptr);
+        return ok && written == command.size();
+    };
+
+    const std::string setCmd = "setdisplaydistance " + std::to_string(pixelShift) + "\r\n";
+    if (!writeCommand(setCmd)) {
+        const DWORD err = GetLastError();
+        CloseHandle(h);
+        std::cerr << "Failed to send Moverio command: " << setCmd
+                  << " (GetLastError=" << err << ")\n";
+        return false;
+    }
+
+    Sleep(20);
+    std::string response;
+    if (writeCommand("getdisplaydistance\r\n")) {
+        char buf[128]{};
+        DWORD read = 0;
+        if (ReadFile(h, buf, DWORD(sizeof(buf) - 1), &read, nullptr) && read > 0) {
+            buf[read] = '\0';
+            response.assign(buf);
+            response.erase(std::remove(response.begin(), response.end(), '\r'), response.end());
+            response.erase(std::remove(response.begin(), response.end(), '\n'), response.end());
+        }
+    }
+    CloseHandle(h);
+    if (!response.empty()) {
+        std::cerr << "Moverio display distance command=" << pixelShift
+                  << " response=" << response << "\n";
+        if (response.find("NG") != std::string::npos) {
+            std::cerr << "Moverio rejected display distance command. Epson documents "
+                         "display distance control as unsupported on BT-35E/30E.\n";
+        }
+    }
+    else {
+        std::cerr << "Moverio display distance set command sent to " << port
+                  << " value=" << pixelShift << " (no getdisplaydistance response)\n";
+    }
+    return true;
+#else
+    static bool warnedUnsupported = false;
+    if (!warnedUnsupported) {
+        std::cerr << "Moverio display distance serial control is implemented for Windows only.\n";
+        warnedUnsupported = true;
+    }
+    return false;
+#endif
 }
 
 static int backendFromEnv() {
@@ -926,6 +1107,15 @@ static int TB_text_scale_pct    = 120;  // %
 static int TB_text_flip_x       = 1;    // 0/1
 static int TB_text_flip_y       = 0;    // 0/1
 static int TB_aruco_smooth_pct  = 50;   // 0..100 => 0..1 EMA for ArUco pose
+static int TB_aruco_every_n_frames = 1; // 1 = detect every captured frame
+static int TB_moverio_imu_enabled = 1;  // 0/1: propagate visual pose with headset orientation
+static int TB_moverio_axis_fix = 1;     // 0/1: map Moverio orientation axes to OpenCV camera axes
+static int TB_moverio_xsens_relative = 1; // 0/1: use head movement relative to Xsens orientation
+static int TB_moverio_xsens_mode = 0;  // 0..3: choose relative rotation formula for hardware-frame testing
+static int TB_moverio_imu_invert = 0;   // 0/1: flip quaternion delta direction for hardware check
+static int TB_moverio_pivot_x_cm = 100; // centered: camera-space pivot offset, cm
+static int TB_moverio_pivot_y_cm = 100; // +Y is down in OpenCV camera coordinates
+static int TB_moverio_pivot_z_cm = 100; // +Z is forward; neck/head pivot is usually negative
 
 // Auto pitch scale from camera intrinsics+homography
 static int  TB_auto_pitch_from_cam = 1;   // 0/1
@@ -934,6 +1124,7 @@ static int  TB_probe_dY_canvas     = 100; // px
 
 // Display / view calibration
 static int  TB_view_hfov_deg       = 23;  // deg; 0 = use camera intrinsics
+static int  TB_display_distance_px = 32;  // slider 0..288 maps to Epson -32..256 px shift
 static bool g_view_center_calibrated = false;
 static double g_view_ray_x = 0.0; // normalized camera ray x/z for display center
 static double g_view_ray_y = 0.0; // normalized camera ray y/z for display center
@@ -970,10 +1161,20 @@ static void save_controls() {
         {"text_flip_x",      TB_text_flip_x},
         {"text_flip_y",      TB_text_flip_y},
         {"aruco_smooth_pct", TB_aruco_smooth_pct},
+        {"aruco_every_n_frames", TB_aruco_every_n_frames},
+        {"moverio_imu_enabled", TB_moverio_imu_enabled},
+        {"moverio_axis_fix", TB_moverio_axis_fix},
+        {"moverio_xsens_relative", TB_moverio_xsens_relative},
+        {"moverio_xsens_mode", TB_moverio_xsens_mode},
+        {"moverio_imu_invert", TB_moverio_imu_invert},
+        {"moverio_pivot_x_cm", TB_moverio_pivot_x_cm},
+        {"moverio_pivot_y_cm", TB_moverio_pivot_y_cm},
+        {"moverio_pivot_z_cm", TB_moverio_pivot_z_cm},
         {"auto_pitch_from_cam", TB_auto_pitch_from_cam},
         {"auto_center_y_px", TB_auto_center_y_px},
         {"probe_dY_canvas",  TB_probe_dY_canvas},
         {"view_hfov_deg",    TB_view_hfov_deg},
+        {"display_distance_px", TB_display_distance_px},
         {"gog_show_markers", TB_gog_show_markers},
         {"gog_show_axes",    TB_gog_show_axes},
         {"gog_off_x_px",     TB_gog_off_x_px},
@@ -1010,10 +1211,23 @@ static void load_controls() {
     get("text_flip_x",       TB_text_flip_x);
     get("text_flip_y",       TB_text_flip_y);
     get("aruco_smooth_pct",  TB_aruco_smooth_pct);
+    get("aruco_every_n_frames", TB_aruco_every_n_frames);
+    TB_aruco_every_n_frames = std::clamp(TB_aruco_every_n_frames, 1, 120);
+    get("moverio_imu_enabled", TB_moverio_imu_enabled);
+    get("moverio_axis_fix", TB_moverio_axis_fix);
+    get("moverio_xsens_relative", TB_moverio_xsens_relative);
+    get("moverio_xsens_mode", TB_moverio_xsens_mode);
+    TB_moverio_xsens_mode = std::clamp(TB_moverio_xsens_mode, 0, 3);
+    get("moverio_imu_invert", TB_moverio_imu_invert);
+    get("moverio_pivot_x_cm", TB_moverio_pivot_x_cm);
+    get("moverio_pivot_y_cm", TB_moverio_pivot_y_cm);
+    get("moverio_pivot_z_cm", TB_moverio_pivot_z_cm);
     get("auto_pitch_from_cam", TB_auto_pitch_from_cam);
     get("auto_center_y_px",    TB_auto_center_y_px);
     get("probe_dY_canvas",     TB_probe_dY_canvas);
     get("view_hfov_deg",      TB_view_hfov_deg);
+    get("display_distance_px", TB_display_distance_px);
+    TB_display_distance_px = std::clamp(TB_display_distance_px, 0, 288);
     get("gog_show_markers",    TB_gog_show_markers);
     get("gog_show_axes",       TB_gog_show_axes);
     get("gog_off_x_px",        TB_gog_off_x_px);
@@ -1029,6 +1243,10 @@ static void load_controls() {
     if (auto e = getEnvString("VIEW_HFOV_DEG")) {
         int v = std::atoi(e->c_str());
         if (v >= 0 && v <= 170) TB_view_hfov_deg = v;
+    }
+    if (auto e = getEnvString("MOVERIO_DISPLAY_DISTANCE")) {
+        int v = std::atoi(e->c_str());
+        if (v >= -32 && v <= 256) TB_display_distance_px = v + 32;
     }
 
     if (j.contains("pitch_ndc_x1000") && !j.contains("pitch_trim_x1000"))
@@ -1072,7 +1290,7 @@ static void saveViewAlignment(size_t sampleCount) {
 }
 
 // ---------- helpers ----------
-// ---------- UI: split controls into 2 windows ----------
+// ---------- UI: split controls into layout, visual alignment, and sensor windows ----------
 
 static void createControlsGroup1()
 {
@@ -1107,15 +1325,15 @@ static void createControlsGroup2(int canvasH)
         cv::createTrackbar(name, "HUD Controls 2", var, maxv, nullptr);
     };
 
-    // Auto pitch calibration + overlay/goggles controls
+    // Visual alignment + overlay/goggles controls
     tb("AutoPitch",       &TB_auto_pitch_from_cam, 1);
     tb("AutoCenterY_px",  &TB_auto_center_y_px, canvasH);
     tb("AutoProbe_dY",    &TB_probe_dY_canvas, 400);
     tb("ViewHFOV_deg",    &TB_view_hfov_deg, 160);
+    tb("DisplayDist",     &TB_display_distance_px, 288);
 
     tb("ShowMarkers",     &TB_gog_show_markers, 1);
     tb("ShowAxes",        &TB_gog_show_axes, 1);
-    tb("ArucoSmooth_pct", &TB_aruco_smooth_pct, 100);
     tb("Gog_OffX",        &TB_gog_off_x_px, 2000);
     tb("Gog_OffY",        &TB_gog_off_y_px, 2000);
 
@@ -1126,6 +1344,29 @@ static void createControlsGroup2(int canvasH)
     tb("OV_Pitch_deg",    &TB_ov_pitch_deg, 360);
     tb("OV_Yaw_deg",      &TB_ov_yaw_deg, 360);
     tb("OV_PivotTL",      &TB_ov_pivot_tl, 1);
+}
+
+static void createControlsGroup3()
+{
+    cv::namedWindow("HUD Controls 3", cv::WINDOW_NORMAL);
+    cv::resizeWindow("HUD Controls 3", 420, 600);
+    cv::moveWindow("HUD Controls 3", 920, 40);
+
+    auto tb = [&](const char* name, int* var, int maxv) {
+        cv::createTrackbar(name, "HUD Controls 3", var, maxv, nullptr);
+    };
+
+    // Tracking cadence + IMU/sensor fusion controls
+    tb("ArucoSmooth_pct", &TB_aruco_smooth_pct, 100);
+    tb("ArucoEveryN",     &TB_aruco_every_n_frames, 120);
+    tb("MoverioIMU",      &TB_moverio_imu_enabled, 1);
+    tb("MoverioAxes",     &TB_moverio_axis_fix, 1);
+    tb("MoverioXsens",    &TB_moverio_xsens_relative, 1);
+    tb("MoverioXMode",    &TB_moverio_xsens_mode, 3);
+    tb("MoverioInv",      &TB_moverio_imu_invert, 1);
+    tb("IMUPivXcm",       &TB_moverio_pivot_x_cm, 200);
+    tb("IMUPivYcm",       &TB_moverio_pivot_y_cm, 200);
+    tb("IMUPivZcm",       &TB_moverio_pivot_z_cm, 200);
 }
 // ---------- UI Thread: OpenCV windows + trackbars ----------
 
@@ -1138,9 +1379,10 @@ static void uiThreadFunc(cv::Size imgSize)
     cv::namedWindow("camera", cv::WINDOW_NORMAL);
     cv::resizeWindow("camera", imgSize.width, imgSize.height);
 
-    // Two control windows
+    // Three control windows: layout, visual alignment, sensors
     createControlsGroup1();
     createControlsGroup2(CANVAS_H);
+    createControlsGroup3();
 
     while (g_running) {
         cv::Mat preview;
@@ -1538,6 +1780,7 @@ int main(int argc, char** argv) {
     };
     refreshViewIntrinsics(TB_view_hfov_deg);
     int prev_view_hfov_deg = TB_view_hfov_deg;
+    int prev_display_distance_px = -1;
 
     // --- ArUco tracker
     ArucoTracking tracker;
@@ -1548,9 +1791,21 @@ int main(int argc, char** argv) {
     tracker.setAnchorMarkerCorner(0, 0);
     int prev_aruco_smooth_pct = std::clamp(TB_aruco_smooth_pct, 0, 100);
     tracker.setTemporalSmoothing(prev_aruco_smooth_pct / 100.0);
+    int prev_aruco_every_n_frames = std::clamp(TB_aruco_every_n_frames, 1, 120);
+    int aruco_frames_until_update = 0;
 
     // --- Sensor
     auto sensor = makeSensor(); sensor->start();
+    MoverioOrientationSource moverioOrientation;
+    moverioOrientation.start();
+    BoardPose imuAnchorPose;
+    cv::Mat imuAnchorHeadRotation;
+    cv::Mat imuAnchorXsensRotation;
+    bool haveImuAnchor = false;
+    bool imuAnchorUsesXsens = false;
+    int prev_moverio_axis_fix = TB_moverio_axis_fix;
+    int prev_moverio_xsens_relative = TB_moverio_xsens_relative;
+    int prev_moverio_xsens_mode = TB_moverio_xsens_mode;
 
     // --- GLFW init
     if (!glfwInit()) { std::cerr << "glfwInit failed\n"; return 1; }
@@ -1728,6 +1983,50 @@ int main(int argc, char** argv) {
     int    alignTargetIdx = 0;
     std::vector<cv::Point2d> alignRaySamples;
     std::vector<AlignTarget> alignTargets = makeAlignmentTargets(MX, MY, MARKER_LEN, GAP);
+
+    // Keep camera I/O off the render path: the BT-35 camera is approximately 30 Hz,
+    // while headset orientation and display updates can use a much higher cadence.
+    std::mutex captureMutex;
+    cv::Mat capturedFrame = frame.clone();
+    unsigned long long capturedSerial = cameraAvailable ? 1 : 0;
+    unsigned long long consumedSerial = 0;
+    std::atomic<bool> capturePumpRun{ false };
+    std::atomic<bool> capturePumpFailed{ false };
+    std::thread captureThread;
+    auto stopCapturePump = [&]() {
+        capturePumpRun = false;
+        if (captureThread.joinable()) captureThread.join();
+    };
+    auto startCapturePump = [&]() {
+        if (!cameraAvailable || captureThread.joinable()) return;
+        capturePumpFailed = false;
+        capturePumpRun = true;
+        captureThread = std::thread([&]() {
+            cv::Mat incoming;
+            while (capturePumpRun && g_running) {
+                if (!cap.grab() || !cap.retrieve(incoming) || incoming.empty()) {
+                    capturePumpFailed = true;
+                    break;
+                }
+                std::lock_guard<std::mutex> lock(captureMutex);
+                capturedFrame = incoming.clone();
+                ++capturedSerial;
+            }
+            capturePumpRun = false;
+        });
+    };
+    auto openCaptureAsync = [&](int index) {
+        stopCapturePump();
+        if (!openCapture(cap, index, camW, camH, camFPS, nullptr, false)) {
+            cameraAvailable = false;
+            return false;
+        }
+        cameraAvailable = true;
+        startCapturePump();
+        return true;
+    };
+    startCapturePump();
+
     auto handleCameraCommand = [&](int k) {
         if (k == 0) return;
         if (k == 'm') {
@@ -1752,9 +2051,8 @@ int main(int argc, char** argv) {
                 auto it = std::find(avail.begin(), avail.end(), camIndex);
                 if (it == avail.end() || ++it == avail.end()) it = avail.begin();
                 int next = *it;
-                if (openCapture(cap, next, camW, camH, camFPS, nullptr, false)) {
+                if (openCaptureAsync(next)) {
                     camIndex = next;
-                    cameraAvailable = true;
                 #ifdef __linux__
                     std::cerr << "Switched to [" << camIndex << "] " << v4l2NameFor(camIndex) << "\n";
                 #else
@@ -1769,9 +2067,8 @@ int main(int argc, char** argv) {
                 if (it == avail.begin() || it == avail.end()) it = avail.end();
                 --it;
                 int prev = *it;
-                if (openCapture(cap, prev, camW, camH, camFPS, nullptr, false)) {
+                if (openCaptureAsync(prev)) {
                     camIndex = prev;
-                    cameraAvailable = true;
                 #ifdef __linux__
                     std::cerr << "Switched to [" << camIndex << "] " << v4l2NameFor(camIndex) << "\n";
                 #else
@@ -1781,9 +2078,8 @@ int main(int argc, char** argv) {
             }
         } else if (k >= '0' && k <= '9') {
             int idx = k - '0';
-            if (openCapture(cap, idx, camW, camH, camFPS, nullptr, false)) {
+            if (openCaptureAsync(idx)) {
                 camIndex = idx;
-                cameraAvailable = true;
             #ifdef __linux__
                 std::cerr << "Switched to [" << camIndex << "] " << v4l2NameFor(camIndex) << "\n";
             #else
@@ -1856,15 +2152,21 @@ int main(int argc, char** argv) {
     while (g_running) {
         g_clk.begin();
 
+        bool newCameraFrame = false;
         if (cameraAvailable) {
-            if (!cap.grab()) {
-                std::cerr << "cap.grab() failed; switching to HUD-only mode.\n";
+            if (capturePumpFailed) {
+                stopCapturePump();
+                std::cerr << "Camera capture failed; switching to HUD-only mode.\n";
                 cameraAvailable = false;
                 ensureFrameValid();
-            } else if (!cap.retrieve(frame) || frame.empty()) {
-                std::cerr << "cap.retrieve() empty; switching to HUD-only mode.\n";
-                cameraAvailable = false;
-                ensureFrameValid();
+            }
+            else {
+                std::lock_guard<std::mutex> lock(captureMutex);
+                if (capturedSerial != consumedSerial && !capturedFrame.empty()) {
+                    capturedFrame.copyTo(frame);
+                    consumedSerial = capturedSerial;
+                    newCameraFrame = true;
+                }
             }
         } else {
             ensureFrameValid();
@@ -1878,7 +2180,20 @@ int main(int argc, char** argv) {
             tracker.setTemporalSmoothing(prev_aruco_smooth_pct / 100.0);
         }
 
-        tracker.update(frame);
+        const int cur_aruco_every_n_frames = std::clamp(TB_aruco_every_n_frames, 1, 120);
+        if (cur_aruco_every_n_frames != prev_aruco_every_n_frames) {
+            prev_aruco_every_n_frames = cur_aruco_every_n_frames;
+            aruco_frames_until_update = 0;
+        }
+        bool ran_aruco_this_frame = false;
+        if (newCameraFrame && aruco_frames_until_update <= 0) {
+            tracker.update(frame);
+            aruco_frames_until_update = cur_aruco_every_n_frames - 1;
+            ran_aruco_this_frame = true;
+        }
+        else if (newCameraFrame) {
+            --aruco_frames_until_update;
+        }
 
         g_clk.stamp_det_done();
 
@@ -1887,8 +2202,61 @@ int main(int argc, char** argv) {
             prev_view_hfov_deg = TB_view_hfov_deg;
             refreshViewIntrinsics(prev_view_hfov_deg);
         }
+        const int displayDistanceSlider = std::clamp(TB_display_distance_px, 0, 288);
+        if (displayDistanceSlider != prev_display_distance_px) {
+            prev_display_distance_px = displayDistanceSlider;
+            sendMoverioDisplayDistance(displayDistanceSlider - 32);
+        }
 
-        BoardPose pose = tracker.latest();
+        BoardPose visualPose = tracker.latest();
+        BoardPose pose = visualPose;
+        const bool useMoverio = TB_moverio_imu_enabled != 0 && moverioOrientation.available();
+        const OrientationSample headOrientation = useMoverio ? moverioOrientation.latest() : OrientationSample{};
+        const SensorSample poseXsens = sensor->latest();
+        constexpr double FUSION_SENSOR_TIMEOUT_SEC = 0.5;
+        const bool xsensFreshForPose = std::isfinite(poseXsens.t_host) && poseXsens.t_host > 0.0 &&
+            !poseXsens.xsens_calibrating &&
+            (nowSeconds() - poseXsens.t_host) <= FUSION_SENSOR_TIMEOUT_SEC;
+        const bool useXsensRelative = TB_moverio_xsens_relative != 0 && xsensFreshForPose;
+        if (TB_moverio_axis_fix != prev_moverio_axis_fix ||
+            TB_moverio_xsens_relative != prev_moverio_xsens_relative ||
+            TB_moverio_xsens_mode != prev_moverio_xsens_mode) {
+            prev_moverio_axis_fix = TB_moverio_axis_fix;
+            prev_moverio_xsens_relative = TB_moverio_xsens_relative;
+            prev_moverio_xsens_mode = TB_moverio_xsens_mode;
+            haveImuAnchor = false;
+            aruco_frames_until_update = 0;
+        }
+
+        if (ran_aruco_this_frame && visualPose.valid) {
+            if (useMoverio && headOrientation.valid) {
+                imuAnchorPose = visualPose;
+                imuAnchorHeadRotation = rotationFromQuaternion(headOrientation);
+                if (useXsensRelative) imuAnchorXsensRotation = rotationFromEulerDegrees(poseXsens);
+                else imuAnchorXsensRotation.release();
+                imuAnchorUsesXsens = useXsensRelative;
+                haveImuAnchor = true;
+            }
+            else {
+                haveImuAnchor = false;
+            }
+        }
+        else if (useMoverio && haveImuAnchor && headOrientation.valid &&
+                 (!imuAnchorUsesXsens || xsensFreshForPose)) {
+            const cv::Mat currentHeadRotation = rotationFromQuaternion(headOrientation);
+            const cv::Mat currentXsensRotation =
+                imuAnchorUsesXsens ? rotationFromEulerDegrees(poseXsens) : cv::Mat{};
+            const cv::Mat pivotCamera = (cv::Mat_<double>(3, 1) <<
+                double(centered(TB_moverio_pivot_x_cm, 200)) * 0.01,
+                double(centered(TB_moverio_pivot_y_cm, 200)) * 0.01,
+                double(centered(TB_moverio_pivot_z_cm, 200)) * 0.01);
+            pose = propagatePoseFromMoverio(imuAnchorPose, imuAnchorHeadRotation, currentHeadRotation,
+                                            imuAnchorXsensRotation, currentXsensRotation, imuAnchorUsesXsens,
+                                            std::clamp(TB_moverio_xsens_mode, 0, 3),
+                                            TB_moverio_axis_fix != 0,
+                                            TB_moverio_imu_invert != 0,
+                                            pivotCamera);
+        }
 
         // --- Compute homography early (so scale applies to BOTH camera and goggles)
         cv::Mat Hh64; bool haveH = false;
@@ -1984,7 +2352,7 @@ int main(int argc, char** argv) {
         g_clk.stamp_hom_done();
 
         // --- Build camera viz base (for preview only)
-        cv::Mat camera = frame; // reuse captured buffer to avoid an extra clone
+        cv::Mat camera = frame.clone(); // preserve the raw frame while rendering faster than camera capture
         if (!tracker.ids().empty())
             cv::aruco::drawDetectedMarkers(camera, tracker.corners(), tracker.ids());
 
@@ -2346,6 +2714,7 @@ int main(int argc, char** argv) {
 
     save_controls();
     g_running = false;
+    stopCapturePump();
     if (uiThread.joinable()) uiThread.join();
 
     if (hudOverlay) {
@@ -2361,6 +2730,7 @@ int main(int argc, char** argv) {
 
     hud.shutdown();
     glfwDestroyWindow(win); glfwTerminate();
+    moverioOrientation.stop();
     sensor->stop();
     return 0;
 }

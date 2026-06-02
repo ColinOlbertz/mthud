@@ -12,7 +12,20 @@ struct SensorSample {
 	double yaw_deg{ 0 };
 
 	// Rates (optional)
+	double gyro_x_dps{ 0 };
+	double gyro_y_dps{ 0 };
 	double gyro_z_dps{ 0 };
+	bool has_gyro{ false };
+
+	// Accelerometer (optional, m/s^2)
+	double acc_x_ms2{ 0 };
+	double acc_y_ms2{ 0 };
+	double acc_z_ms2{ 0 };
+	bool has_accel{ false };
+
+	// Startup calibration status for Xsens low-level inertial diagnostics.
+	bool xsens_calibrating{ false };
+	double xsens_calibration_progress{ 1.0 };
 
 	// Kinematics
 	double vel_x_ms{ 0 };

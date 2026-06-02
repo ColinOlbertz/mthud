@@ -30,10 +30,18 @@ set(MTHUD_SOURCES
   src/hud_renderer.cpp
   src/config.cpp
   src/sensor_xsens.cpp
+  src/moverio_sensor.cpp
 )
 
 add_executable(mthud ${MTHUD_SOURCES})
 add_executable(calibrate_bt35e_intrinsics src/tools/calibrate_bt35e_intrinsics.cpp)
+add_executable(compare_imus
+  src/tools/compare_imus.cpp
+  src/sensor_xsens.cpp
+  src/moverio_sensor.cpp
+)
+
+set(XSENS_RUNTIME_TARGETS mthud compare_imus)
 
 # String macro used by your code
 target_compile_definitions(mthud PRIVATE PROJECT_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
@@ -42,9 +50,13 @@ target_compile_definitions(mthud PRIVATE PROJECT_SOURCE_DIR="${CMAKE_SOURCE_DIR}
 if(MSVC)
   target_compile_options(mthud PRIVATE /W4 /permissive-)
   target_compile_options(calibrate_bt35e_intrinsics PRIVATE /W4 /permissive-)
+  target_compile_options(compare_imus PRIVATE /W4 /permissive-)
+  target_compile_definitions(mthud PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX)
+  target_compile_definitions(compare_imus PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX)
 else()
   target_compile_options(mthud PRIVATE -Wall -Wextra -Wpedantic)
   target_compile_options(calibrate_bt35e_intrinsics PRIVATE -Wall -Wextra -Wpedantic)
+  target_compile_options(compare_imus PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
 # Base include paths
@@ -52,6 +64,9 @@ target_include_directories(mthud PRIVATE
   ${OpenCV_INCLUDE_DIRS}
 )
 target_include_directories(calibrate_bt35e_intrinsics PRIVATE
+  ${OpenCV_INCLUDE_DIRS}
+)
+target_include_directories(compare_imus PRIVATE
   ${OpenCV_INCLUDE_DIRS}
 )
 
@@ -67,6 +82,10 @@ target_link_libraries(mthud PRIVATE
 target_link_libraries(calibrate_bt35e_intrinsics PRIVATE
   ${OpenCV_LIBS}
 )
+target_link_libraries(compare_imus PRIVATE
+  ${OpenCV_LIBS}
+  Threads::Threads
+)
 
 if(spdlog_FOUND)
   target_link_libraries(mthud PRIVATE spdlog::spdlog_header_only)
@@ -77,13 +96,16 @@ if(UNIX AND NOT APPLE)
 endif()
 
 if(WIN32)
-  target_link_libraries(mthud PRIVATE mf mfplat mfuuid ole32)
+  target_link_libraries(mthud PRIVATE mf mfplat mfuuid ole32 sensorsapi propsys)
   target_link_libraries(calibrate_bt35e_intrinsics PRIVATE mf mfplat mfuuid ole32)
+  target_link_libraries(compare_imus PRIVATE ole32 sensorsapi propsys)
 endif()
 
 # ---- Xsens MT SDK ----------------------------------------------------------
 if(USE_XSENS)
-  target_compile_definitions(mthud PRIVATE USE_XSENS=1)
+  foreach(_target IN LISTS XSENS_RUNTIME_TARGETS)
+    target_compile_definitions(${_target} PRIVATE USE_XSENS=1)
+  endforeach()
 
   option(XSENS_USE_STATIC "Use locally built static Xsens libs (xspublic)" OFF)
 
@@ -138,19 +160,25 @@ if(USE_XSENS)
     endif()
 
     message(STATUS "Using Xsens static libs from ${_xsroot}")
-    target_compile_definitions(mthud PRIVATE XSENS_USE_STATIC=1)
+    foreach(_target IN LISTS XSENS_RUNTIME_TARGETS)
+      target_compile_definitions(${_target} PRIVATE XSENS_USE_STATIC=1)
+    endforeach()
     if(NOT XSENS_INCLUDE_DIR)
       set(XSENS_INCLUDE_DIR "${_xsroot}")
     endif()
-    target_include_directories(mthud PRIVATE
-      "${XSENS_INCLUDE_DIR}"
-      "${_xsroot}" "${_xsroot}/xscontroller" "${_xsroot}/xscommon" "${_xsroot}/xstypes")
+    foreach(_target IN LISTS XSENS_RUNTIME_TARGETS)
+      target_include_directories(${_target} PRIVATE
+        "${XSENS_INCLUDE_DIR}"
+        "${_xsroot}" "${_xsroot}/xscontroller" "${_xsroot}/xscommon" "${_xsroot}/xstypes")
 
-    target_link_libraries(mthud PRIVATE
-      "${_XS_CTRL}" "${_XS_COMM}" "${_XS_TYPE}"
-      pthread rt dl)
+      target_link_libraries(${_target} PRIVATE
+        "${_XS_CTRL}" "${_XS_COMM}" "${_XS_TYPE}"
+        pthread rt dl)
+    endforeach()
     if(TARGET xsens_static_libs)
-      add_dependencies(mthud xsens_static_libs)
+      foreach(_target IN LISTS XSENS_RUNTIME_TARGETS)
+        add_dependencies(${_target} xsens_static_libs)
+      endforeach()
     endif()
   else()
     if(WIN32)
@@ -169,34 +197,44 @@ if(USE_XSENS)
       endif()
 
       # Make runtime find the shared libs
-      set_target_properties(mthud PROPERTIES
-        BUILD_RPATH   "${XSENS_SDK_ROOT}/lib;$ORIGIN"
-        INSTALL_RPATH "${XSENS_SDK_ROOT}/lib;$ORIGIN")
+      foreach(_target IN LISTS XSENS_RUNTIME_TARGETS)
+        set_target_properties(${_target} PROPERTIES
+          BUILD_RPATH   "${XSENS_SDK_ROOT}/lib;$ORIGIN"
+          INSTALL_RPATH "${XSENS_SDK_ROOT}/lib;$ORIGIN")
+      endforeach()
 
       # Also drop the .so files next to the exe for convenience
-      add_custom_command(TARGET mthud POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${XSENS_SDK_ROOT}/lib/libxsensdeviceapi.so" "$<TARGET_FILE_DIR:mthud>/"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${XSENS_SDK_ROOT}/lib/libxstypes.so" "$<TARGET_FILE_DIR:mthud>/")
+      foreach(_target IN LISTS XSENS_RUNTIME_TARGETS)
+        add_custom_command(TARGET ${_target} POST_BUILD
+          COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                  "${XSENS_SDK_ROOT}/lib/libxsensdeviceapi.so" "$<TARGET_FILE_DIR:${_target}>/"
+          COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                  "${XSENS_SDK_ROOT}/lib/libxstypes.so" "$<TARGET_FILE_DIR:${_target}>/")
+      endforeach()
     endif()
 
-    target_include_directories(mthud PRIVATE "${XSENS_INCLUDE_DIR}")
-    target_link_libraries(mthud PRIVATE "${XSENS_LIB}" "${XSTYPES_LIB}")
+    foreach(_target IN LISTS XSENS_RUNTIME_TARGETS)
+      target_include_directories(${_target} PRIVATE "${XSENS_INCLUDE_DIR}")
+      target_link_libraries(${_target} PRIVATE "${XSENS_LIB}" "${XSTYPES_LIB}")
+    endforeach()
 
     if(WIN32)
       # Drop the DLLs next to the exe so runtime can find them
       file(GLOB _XSENS_DLLS "${XSENS_SDK_ROOT}/lib/*.dll")
-      add_custom_command(TARGET mthud POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${_XSENS_DLLS} "$<TARGET_FILE_DIR:mthud>/"
-        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:mthud>/platforms"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${XSENS_SDK_ROOT}/lib/platforms/qwindows.dll"
-                "$<TARGET_FILE_DIR:mthud>/platforms/")
+      foreach(_target IN LISTS XSENS_RUNTIME_TARGETS)
+        add_custom_command(TARGET ${_target} POST_BUILD
+          COMMAND ${CMAKE_COMMAND} -E copy_if_different ${_XSENS_DLLS} "$<TARGET_FILE_DIR:${_target}>/"
+          COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:${_target}>/platforms"
+          COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                  "${XSENS_SDK_ROOT}/lib/platforms/qwindows.dll"
+                  "$<TARGET_FILE_DIR:${_target}>/platforms/")
+      endforeach()
     endif()
   endif()
 else()
-  target_compile_definitions(mthud PRIVATE USE_XSENS=0)
+  foreach(_target IN LISTS XSENS_RUNTIME_TARGETS)
+    target_compile_definitions(${_target} PRIVATE USE_XSENS=0)
+  endforeach()
 endif()
 
 # ---- Runtime assets --------------------------------------------------------
@@ -227,6 +265,10 @@ if(EXISTS "${_opencv_bin_dir}")
       COMMAND ${CMAKE_COMMAND} -E copy_if_different
               ${_opencv_runtime_dlls}
               "$<TARGET_FILE_DIR:calibrate_bt35e_intrinsics>/")
+    add_custom_command(TARGET compare_imus POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+              ${_opencv_runtime_dlls}
+              "$<TARGET_FILE_DIR:compare_imus>/")
   endif()
 endif()
 
